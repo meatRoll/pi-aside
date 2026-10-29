@@ -16,6 +16,7 @@ A good fit: the AI is writing a long document or running a task, and you want to
 - **Truly detachable**: `Esc` only hides the panel — answers keep streaming in the background. The footer shows progress and a notification appears when done. Multiple tabs can run in parallel (up to 9).
 - **Reading position preserved**: the panel is an overlay, so the main transcript does not move. Reopening it returns you to where you were.
 - **Automatic read-only snapshot**: opening a tab captures the last assistant reply and the user request before it as reference material for the side model.
+- **Read-only tools**: when the snapshot is not enough, the side model can inspect the repo or system files with `read` / `grep` / `find` / `ls` and fetch a URL with `web_fetch`. There is no `bash`, `edit`, or `write` tool, so it cannot modify files.
 - **Optional write-back**: only `Ctrl+Y` writes a Q&A turn into the main conversation. That is the only step that enters the main context.
 - **Independent model**: use a cheap/fast model for explanations without spending the main model's budget.
 - **Bilingual UI**: follows the system language by default — Chinese only when the system locale is Chinese, English otherwise. The panel title shows the current mode and shortcut (`Language: Auto (EN) · Ctrl+L` / `语言：跟随系统（中文）· Ctrl+L`); press `Ctrl+L` (or click the label in fullscreen mode) to cycle through Auto / English / Chinese. The choice is saved to `aside.json`.
@@ -74,6 +75,7 @@ You can use it while the main agent is streaming.
 | `Ctrl+End` | Jump to the latest output |
 | `Ctrl+R` | Re-capture the main-conversation snapshot |
 | `Ctrl+T` | Toggle the snapshot (when off, the side model only sees your question) |
+| `Ctrl+G` | Toggle read-only tools for the current tab |
 | `Ctrl+L` | Cycle interface language: Auto / English / Chinese (saved to `aside.json`) |
 | `Ctrl+Y` | Write the latest Q&A turn into the main conversation (**only this enters the main context**) |
 
@@ -89,7 +91,11 @@ Optional file: `~/.pi/agent/aside.json`
   "model": "provider/model-id",
   "maxContextChars": 24000,
   "maxAnswerTokens": 4000,
-  "notifyOnComplete": true
+  "notifyOnComplete": true,
+  "tools": true,
+  "network": true,
+  "maxToolCalls": 12,
+  "maxToolResultChars": 12000
 }
 ```
 
@@ -105,6 +111,14 @@ Optional file: `~/.pi/agent/aside.json`
 - `maxAnswerTokens`: token limit for a single side answer.
 - `notifyOnComplete`: whether to show a notification when an answer completes while
   the panel is closed.
+- `tools`: enable the read-only tools (`read`, `grep`, `find`, `ls`). Default `true`.
+  Press `Ctrl+G` inside the panel to toggle them per tab.
+- `network`: enable `web_fetch` for specific http(s) URLs. Default `true`; it is only
+  registered when `tools` is on. There is no web search.
+- `maxToolCalls`: maximum tool calls per question (default 12). When the budget runs
+  out, the side model answers with the evidence gathered so far.
+- `maxToolResultChars`: maximum characters kept from one tool result (default 12000).
+  Built-in tools already truncate large outputs; this is a second token budget.
 
 Side requests always use `reasoning: "low"` to favor speed.
 
@@ -113,7 +127,10 @@ Side requests always use `reasoning: "low"` to favor speed.
 1. The side conversation has its own message array and calls
    `ctx.modelRegistry.streamSimple(model, ...)` directly. It **does not** go through
    `session.prompt()`, so no message is written to the session file.
-2. The request context declares no tools, so the model cannot modify files or run commands.
+2. The side agent runs its own tool loop with a closed set of tools: `read`, `grep`,
+   `find`, `ls`, and optionally `web_fetch`. `bash`, `edit`, and `write` are never
+   registered, so the model has no tool that can modify files. `web_fetch` only
+   performs GET requests and refuses localhost/private addresses.
 3. Opening a tab captures a **read-only snapshot**: the last assistant reply on the
    current branch plus the user request before it. The snapshot is sent as part of the
    system prompt and is a copy; later changes in the main conversation are not synced
@@ -127,9 +144,15 @@ for subsequent model calls.
 
 ## Known limits
 
-- The snapshot contains text only — no tool output, file contents, or images. To
-  explain a particular file, pasting the relevant excerpt into your question is more
-  reliable.
+- There is no web search. `web_fetch` works only when you have a specific http(s) URL;
+  searching needs a search API and is not implemented.
+- Reads are not restricted to the project: the side model can read anything the pi
+  process can read (same as the main agent). It still cannot write, but do not point it
+  at secrets you would not send to your model provider.
+- `grep` and `find` use `rg` / `fd`; like the main agent, pi may download them on first
+  use if they are missing.
+- Tool calls add tokens and latency. Toggle tools off with `Ctrl+G` when the snapshot is
+  enough.
 - Token usage for side requests appears in the panel status line but is not counted
   in the main session's usage statistics.
 - Side history lives in memory. Switching sessions (`/new`, `/resume`, `/fork`) or
