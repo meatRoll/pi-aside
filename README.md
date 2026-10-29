@@ -18,7 +18,7 @@ A good fit: the AI is writing a long document or running a task, and you want to
 - **Automatic read-only snapshot**: opening a tab captures the last assistant reply and the user request before it as reference material for the side model.
 - **Optional write-back**: only `Ctrl+Y` writes a Q&A turn into the main conversation. That is the only step that enters the main context.
 - **Independent model**: use a cheap/fast model for explanations without spending the main model's budget.
-- **Bilingual UI**: follows the system language by default — Chinese only when the system locale is Chinese, English otherwise. The panel title shows the current mode (`Language: Auto (EN)` / `语言：跟随系统（中文）`); press `Ctrl+L` (or click the label in fullscreen mode) to cycle through Auto / English / Chinese. The choice is saved to `aside.json`.
+- **Bilingual UI**: follows the system language by default — Chinese only when the system locale is Chinese, English otherwise. The panel title shows the current mode and shortcut (`Language: Auto (EN) · Ctrl+L` / `语言：跟随系统（中文）· Ctrl+L`); press `Ctrl+L` (or click the label in fullscreen mode) to cycle through Auto / English / Chinese. The choice is saved to `aside.json`.
 
 ## Install
 
@@ -55,7 +55,7 @@ rm ~/.pi/agent/extensions/aside.ts
 
 - `Ctrl+Shift+S` opens the panel
 - `/aside what does this command do?` in the main editor opens it with a first question
-- Inside the panel, the title shows the current mode (`Language: Auto (EN)` / `Language: EN` / `语言：跟随系统（中文）` / `语言：中文`); `Ctrl+L` cycles Auto / English / Chinese, or click the label in fullscreen mode
+- Inside the panel, the title shows the current mode and shortcut (`Language: Auto (EN) · Ctrl+L` / `Language: EN · Ctrl+L` / `语言：跟随系统（中文）· Ctrl+L` / `语言：中文 · Ctrl+L`); press `Ctrl+L` to cycle Auto / English / Chinese, or click the label in fullscreen mode
 - `/aside-model [provider/model]` picks the side model
 
 You can use it while the main agent is streaming.

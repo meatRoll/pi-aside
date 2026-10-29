@@ -185,7 +185,6 @@ interface UiMessages {
 	followMainModel: string;
 
 	languageBadge: (option: LanguageOption) => string;
-	noteLanguage: (option: LanguageOption) => string;
 }
 
 function count(n: number, one: string, many: string): string {
@@ -240,7 +239,7 @@ const EN_MESSAGES: UiMessages = {
 
 	hints: [
 		"enter send · shift+enter newline · esc close (keeps running) · ctrl+c cancel",
-		"ctrl+l language · ctrl+y write back · ctrl+r refresh snapshot · ctrl+t toggle",
+		"ctrl+y write back · ctrl+r refresh snapshot · ctrl+t toggle",
 		"shift+←/→ tabs · ctrl+n new · ctrl+x close · pgup/pgdn scroll",
 	],
 
@@ -269,9 +268,8 @@ const EN_MESSAGES: UiMessages = {
 	modelSelectTitle: (current) => `Aside model (current: ${current})`,
 	followMainModel: "follow main model",
 
-	languageBadge: (option) => (option === "auto" ? "Language: Auto (EN)" : "Language: EN"),
-	noteLanguage: (option) =>
-		option === "auto" ? "Language: Auto (English) · Ctrl+L to switch" : "Language: English · Ctrl+L to switch",
+	languageBadge: (option) =>
+		option === "auto" ? "Language: Auto (EN) · Ctrl+L" : "Language: EN · Ctrl+L",
 };
 
 const ZH_MESSAGES: UiMessages = {
@@ -322,7 +320,7 @@ const ZH_MESSAGES: UiMessages = {
 
 	hints: [
 		"enter 发送 · shift+enter 换行 · esc 关闭（后台继续）· ctrl+c 取消生成",
-		"ctrl+l 切换语言 · ctrl+y 写回主对话 · ctrl+r 刷新快照 · ctrl+t 快照开关",
+		"ctrl+y 写回主对话 · ctrl+r 刷新快照 · ctrl+t 快照开关",
 		"shift+←/→ 切换 tab · ctrl+n 新建 · ctrl+x 关闭 · pgup/pgdn 滚动",
 	],
 
@@ -351,8 +349,8 @@ const ZH_MESSAGES: UiMessages = {
 	modelSelectTitle: (current) => `Aside 模型（当前：${current}）`,
 	followMainModel: "跟随主模型",
 
-	languageBadge: (option) => (option === "auto" ? "语言：跟随系统（中文）" : "语言：中文"),
-	noteLanguage: (option) => (option === "auto" ? "界面语言：跟随系统（中文）· Ctrl+L 切换" : "界面语言：中文 · Ctrl+L 切换"),
+	languageBadge: (option) =>
+		option === "auto" ? "语言：跟随系统（中文）· Ctrl+L" : "语言：中文 · Ctrl+L",
 };
 
 let uiLanguage: Language = "en";
@@ -912,7 +910,6 @@ class AsidePanel implements Component, Focusable {
 		};
 		this.editor.focused = false;
 		this.loadDraft();
-		this.note = t().noteLanguage(uiLanguageOption);
 	}
 
 	dispose(): void {
@@ -1154,7 +1151,7 @@ class AsidePanel implements Component, Focusable {
 		this.runtime.config.language = next;
 		saveAsideConfig(this.runtime.config);
 		updateFooter(this.runtime);
-		this.setStatusNote(t().noteLanguage(next));
+		this.requestRender();
 	}
 
 	private promote(): void {
