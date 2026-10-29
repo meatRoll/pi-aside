@@ -1,84 +1,91 @@
 # pi-aside
 
-[Pi](https://pi.dev) 扩展：**在主对话旁边阅读与提问**。
+[English](README.md) | [简体中文](README.zh-CN.md)
 
-主代理跑它的，你在浮层面板里问你的。问答不进主 session、不 steer/queue 主代理，
-也不会滚动或重排 transcript —— 关掉面板，你还在原来那一屏。
+A [Pi](https://pi.dev) extension: **read and ask questions alongside the main conversation**.
 
-适合这种场景：AI 正在写长文档或跑任务，你想边看边问「这个词什么意思」
-「这段代码为什么这么写」，又不想弄乱主对话上下文、不想让正在看的输出被顶走。
+The main agent keeps doing its thing; you ask your questions in an overlay panel. The Q&A never enters the main session, never steers or queues the main agent, and never scrolls or reflows the transcript — close the panel and you are back on the same screen.
 
-## 特性
+A good fit: the AI is writing a long document or running a task, and you want to ask "what does this term mean" or "why is this code written this way" while reading, without polluting the main context or pushing the output you are reading away.
 
-- **上下文隔离**：侧边问答有独立消息数组，直接调用 `ctx.modelRegistry.streamSimple()`，
-  不经过 `session.prompt()`，不写 session 文件。
-- **不打断主代理**：独立请求；主代理流式输出时也能提问，不会插进当前 run。
-- **能真正离开**：`Esc` 只关闭面板，回答在后台继续；footer 显示进度，
-  回答完成可弹通知。多个 tab 可以并行跑（最多 9 个）。
-- **不挤走阅读位置**：overlay 面板，主 transcript 不动，再打开回到原位置。
-- **自动附带只读快照**：打开 tab 时抓取最后一条助手回复 + 它之前的用户请求，
-  作为 side model 的参考资料。
-- **可选写回**：`Ctrl+Y` 才把某一轮问答写回主对话（只有这一步会进入主上下文）。
-- **可单独选模型**：用便宜/快的模型做解释，不必占用主模型额度。
+## Features
 
-## 安装
+- **Context isolation**: the side conversation has its own message array and calls
+  `ctx.modelRegistry.streamSimple()` directly. It bypasses `session.prompt()` and never writes to the session file.
+- **No interruption**: side requests are independent. You can ask while the main agent is streaming; nothing is injected into the current run.
+- **Truly detachable**: `Esc` only hides the panel — answers keep streaming in the background. The footer shows progress and a notification appears when done. Multiple tabs can run in parallel (up to 9).
+- **Reading position preserved**: the panel is an overlay, so the main transcript does not move. Reopening it returns you to where you were.
+- **Automatic read-only snapshot**: opening a tab captures the last assistant reply and the user request before it as reference material for the side model.
+- **Optional write-back**: only `Ctrl+Y` writes a Q&A turn into the main conversation. That is the only step that enters the main context.
+- **Independent model**: use a cheap/fast model for explanations without spending the main model's budget.
+- **Bilingual UI**: follows the system language by default — Chinese only when the system locale is Chinese, English otherwise. The panel title shows the current mode (`Language: Auto (EN)` / `语言：跟随系统（中文）`); press `Ctrl+L` (or click the label in fullscreen mode) to cycle through Auto / English / Chinese. The choice is saved to `aside.json`.
+
+## Install
 
 ```bash
 git clone https://github.com/meatRoll/pi-aside.git
 cp pi-aside/aside.ts ~/.pi/agent/extensions/aside.ts
 ```
 
-之后在 pi 里执行 `/reload`（或重启 pi）即可。
+Then run `/reload` in pi (or restart pi).
 
-更新：
+Update:
 
 ```bash
 cd pi-aside && git pull && cp aside.ts ~/.pi/agent/extensions/aside.ts
 ```
 
-不想装到全局，也可以只在需要时加载：
+To try it without a global install, load it for one invocation:
 
 ```bash
 pi --extension /path/to/pi-aside/aside.ts
 ```
 
-卸载：
+Uninstall:
 
 ```bash
 rm ~/.pi/agent/extensions/aside.ts
 ```
 
-## 使用
+> Keep a single copy. If the same extension is loaded both as a user extension and
+> from a package, Pi registers `aside:1` / `aside:2` and the older copy may win.
+> Remove one of them, then run `/reload`.
 
-- `Ctrl+Shift+S` 打开面板
-- 或在主编辑器里输入 `/aside 这条命令是什么意思？`
+## Usage
 
-主代理正在输出时也可以直接用。
+- `Ctrl+Shift+S` opens the panel
+- `/aside what does this command do?` in the main editor opens it with a first question
+- Inside the panel, the title shows the current mode (`Language: Auto (EN)` / `Language: EN` / `语言：跟随系统（中文）` / `语言：中文`); `Ctrl+L` cycles Auto / English / Chinese, or click the label in fullscreen mode
+- `/aside-model [provider/model]` picks the side model
 
-| 键 | 作用 |
+You can use it while the main agent is streaming.
+
+| Key | Action |
 |---|---|
-| `Enter` | 发送问题 |
-| `Shift+Enter` / `Ctrl+J` | 换行 |
-| `Esc` | 关闭面板（请求在后台继续） |
-| `Ctrl+C` | 取消当前 tab 的生成 |
-| `Ctrl+N` | 新建 tab |
-| `Ctrl+X` | 关闭当前 tab |
-| `Shift+←` / `Shift+→` | 切换 tab |
-| `PageUp` / `PageDown` | 滚动侧边回答 |
-| `Alt+↑` / `Alt+↓` | 单行滚动 |
-| `Ctrl+End` | 回到最新 |
-| `Ctrl+R` | 重新抓取主对话快照 |
-| `Ctrl+T` | 开关快照（关掉后侧边模型只看得到你的问题） |
-| `Ctrl+Y` | 把最近一轮问答写回主对话（**这一步才会进入主上下文**） |
+| `Enter` | Send the question |
+| `Shift+Enter` / `Ctrl+J` | New line |
+| `Esc` | Close the panel (the request keeps running) |
+| `Ctrl+C` | Cancel the active tab's generation |
+| `Ctrl+N` | New tab |
+| `Ctrl+X` | Close the current tab |
+| `Shift+←` / `Shift+→` | Switch tabs |
+| `PageUp` / `PageDown` | Scroll the side answer |
+| `Alt+↑` / `Alt+↓` | Scroll one line |
+| `Ctrl+End` | Jump to the latest output |
+| `Ctrl+R` | Re-capture the main-conversation snapshot |
+| `Ctrl+T` | Toggle the snapshot (when off, the side model only sees your question) |
+| `Ctrl+L` | Cycle interface language: Auto / English / Chinese (saved to `aside.json`) |
+| `Ctrl+Y` | Write the latest Q&A turn into the main conversation (**only this enters the main context**) |
 
-鼠标滚轮也可以滚动。
+The mouse wheel also scrolls.
 
-## 配置
+## Configuration
 
-可选文件：`~/.pi/agent/aside.json`
+Optional file: `~/.pi/agent/aside.json`
 
 ```json
 {
+  "language": "auto",
   "model": "provider/model-id",
   "maxContextChars": 24000,
   "maxAnswerTokens": 4000,
@@ -86,40 +93,53 @@ rm ~/.pi/agent/extensions/aside.ts
 }
 ```
 
-- `model`：侧边问答单独用的模型；不填则跟随主对话当前模型。
-  也可以随时用 `/aside-model` 选择，选择结果会写回这个文件。
-- `maxContextChars`：快照最多保留多少字符（超出时保留头 65% + 尾 35%，中间标注省略）。
-- `maxAnswerTokens`：单次侧边回答的 token 上限。
-- `notifyOnComplete`：面板关闭时，回答完成是否弹通知。
+- `language`: interface and system-prompt language — `"auto"` (default) follows the
+  system locale: Chinese only when the system language is Chinese, English otherwise.
+  `"en"` / `"zh"` force a language. Press `Ctrl+L` inside the panel to cycle
+  Auto / English / Chinese; the choice is written back to this file.
+- `model`: model used only for Aside Q&A; when omitted, the main conversation's
+  current model is used. You can also pick one with `/aside-model`; the choice is
+  written back to this file.
+- `maxContextChars`: maximum characters kept in the snapshot (when exceeded, keep the
+  first 65% and the last 35%, with the omitted middle marked).
+- `maxAnswerTokens`: token limit for a single side answer.
+- `notifyOnComplete`: whether to show a notification when an answer completes while
+  the panel is closed.
 
-侧边请求固定使用 `reasoning: "low"`，优先速度。
+Side requests always use `reasoning: "low"` to favor speed.
 
-## 它是怎么隔离的
+## How isolation works
 
-1. 侧边问答有独立的消息数组，直接调用
-   `ctx.modelRegistry.streamSimple(model, ...)`，**不经过** `session.prompt()`，
-   所以不会往 session 文件里写任何消息。
-2. 请求 context 里不声明 tools，模型没有改文件或执行命令的能力。
-3. 打开 tab 时抓一份**只读快照**：当前分支最后一条助手回复 + 它之前的一条用户请求。
-   快照作为 system prompt 的一部分发送，是副本；主对话后续的变化不会自动同步
-   （需要 `Ctrl+R`）。
-4. 面板是 overlay：主 transcript 不滚动、不重绘位置，阅读位置保持不变。
+1. The side conversation has its own message array and calls
+   `ctx.modelRegistry.streamSimple(model, ...)` directly. It **does not** go through
+   `session.prompt()`, so no message is written to the session file.
+2. The request context declares no tools, so the model cannot modify files or run commands.
+3. Opening a tab captures a **read-only snapshot**: the last assistant reply on the
+   current branch plus the user request before it. The snapshot is sent as part of the
+   system prompt and is a copy; later changes in the main conversation are not synced
+   automatically (use `Ctrl+R`).
+4. The panel is an overlay: the main transcript does not scroll or re-layout, so your
+   reading position stays where it was.
 
-唯一会写回主对话的操作是 `Ctrl+Y`，它用 `pi.sendMessage()` 添加一条
-`aside` 类型的 custom message（会进入后续模型上下文）。
+The only action that writes back to the main conversation is `Ctrl+Y`. It adds an
+`aside` custom message via `pi.sendMessage()`, which becomes part of the main context
+for subsequent model calls.
 
-## 已知边界
+## Known limits
 
-- 快照只包含主对话的文本，不含工具输出、文件内容和图片。
-  想解释某个文件，把相关片段贴进问题里更可靠。
-- 侧边请求的 token 用量显示在面板状态行，但不计入主 session 的用量统计。
-- 侧边历史保存在内存里；切换 session（`/new`、`/resume`、`/fork`）或退出 pi 后清空。
-- 只支持 TUI 模式；RPC/print 模式下 `/aside` 会给出提示。
-- `Ctrl+Shift+S` 可能被个别终端占用；用 `/aside` 命令总能打开。
+- The snapshot contains text only — no tool output, file contents, or images. To
+  explain a particular file, pasting the relevant excerpt into your question is more
+  reliable.
+- Token usage for side requests appears in the panel status line but is not counted
+  in the main session's usage statistics.
+- Side history lives in memory. Switching sessions (`/new`, `/resume`, `/fork`) or
+  exiting pi clears it.
+- TUI mode only. In RPC/print mode, `/aside` shows a hint instead.
+- `Ctrl+Shift+S` may be captured by some terminals; `/aside` always opens the panel.
 
-## 开发
+## Development
 
-类型检查可以复用 pi 源码仓库的 `tsconfig.json` 与路径映射：
+Type-checking can reuse the pi source repository's `tsconfig.json` and path mappings:
 
 ```bash
 cd /path/to/pi
@@ -130,8 +150,15 @@ JSON
 rm tsconfig.aside.json
 ```
 
-> 注意：`pi` 的启动脚本在源码仓库存在未跟踪文件时会拒绝 `git pull`，
-> 检查完记得删掉临时的 `tsconfig.aside.json`。
+To test a local build in pi:
+
+```bash
+cp aside.ts ~/.pi/agent/extensions/aside.ts
+# then run /reload inside pi
+```
+
+> Note: pi's launcher refuses to `git pull` when the source repository has untracked
+> files. Delete the temporary `tsconfig.aside.json` when you are done.
 
 ## License
 
