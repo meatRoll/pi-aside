@@ -1,0 +1,7 @@
+.DS_Store
+node_modules/
+*.log
+
+# 个人配置与本机工具
+aside.json
+migrate-session.sh
