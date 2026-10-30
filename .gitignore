@@ -5,3 +5,6 @@ node_modules/
 # 个人配置与本机工具
 aside.json
 migrate-session.sh
+
+# 本机 tsconfig 指向本地 pi 源码，路径依机器而定
+tsconfig.json
