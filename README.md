@@ -16,7 +16,7 @@ A good fit: the AI is writing a long document or running a task, and you want to
 - **Truly detachable**: `Esc` only hides the panel — answers keep streaming in the background. The footer shows progress and a notification appears when done. Multiple tabs can run in parallel (up to 9).
 - **Reading position preserved**: the panel is an overlay, so the main transcript does not move. Reopening it returns you to where you were.
 - **Automatic read-only snapshot**: opening a tab captures the last assistant reply and the user request before it as reference material for the side model.
-- **Read-only tools**: when the snapshot is not enough, the side model can inspect the repo or system files with `read` / `grep` / `find` / `ls` and fetch a URL with `web_fetch`. There is no `bash`, `edit`, or `write` tool, so it cannot modify files.
+- **Read-only tools**: when the snapshot is not enough, the side model can inspect the repo or system files with `read` / `grep` / `find` / `ls`, read git history and commit data with `git`, and fetch a URL with `web_fetch`. There is no `bash`, `edit`, or `write` tool, so it cannot modify files.
 - **Optional write-back**: only `Ctrl+Y` writes a Q&A turn into the main conversation. That is the only step that enters the main context.
 - **Independent model**: use a cheap/fast model for explanations without spending the main model's budget.
 - **Bilingual UI**: follows the system language by default — Chinese only when the system locale is Chinese, English otherwise. The panel title shows the current mode and shortcut (`Language: Auto (EN) · Ctrl+L` / `语言：跟随系统（中文）· Ctrl+L`); press `Ctrl+L` (or click the label in fullscreen mode) to cycle through Auto / English / Chinese. The choice is saved to `aside.json`.
@@ -93,6 +93,7 @@ Optional file: `~/.pi/agent/aside.json`
   "maxAnswerTokens": 4000,
   "notifyOnComplete": true,
   "tools": true,
+  "git": true,
   "network": true,
   "maxToolCalls": 12,
   "maxToolResultChars": 12000
@@ -111,8 +112,11 @@ Optional file: `~/.pi/agent/aside.json`
 - `maxAnswerTokens`: token limit for a single side answer.
 - `notifyOnComplete`: whether to show a notification when an answer completes while
   the panel is closed.
-- `tools`: enable the read-only tools (`read`, `grep`, `find`, `ls`). Default `true`.
+- `tools`: enable the read-only tools (`read`, `grep`, `find`, `ls`, `git`). Default `true`.
   Press `Ctrl+G` inside the panel to toggle them per tab.
+- `git`: enable the read-only git tool. Default `true`; it is only registered when
+  `tools` is on. It exposes `show`, `log`, `diff`, `blame`, `file`, `status`,
+  `branches`, `tags`, and `ls`; there is no arbitrary git command execution.
 - `network`: enable `web_fetch` for specific http(s) URLs. Default `true`; it is only
   registered when `tools` is on. There is no web search.
 - `maxToolCalls`: maximum tool calls per question (default 12). When the budget runs
@@ -128,9 +132,10 @@ Side requests always use `reasoning: "low"` to favor speed.
    `ctx.modelRegistry.streamSimple(model, ...)` directly. It **does not** go through
    `session.prompt()`, so no message is written to the session file.
 2. The side agent runs its own tool loop with a closed set of tools: `read`, `grep`,
-   `find`, `ls`, and optionally `web_fetch`. `bash`, `edit`, and `write` are never
-   registered, so the model has no tool that can modify files. `web_fetch` only
-   performs GET requests and refuses localhost/private addresses.
+   `find`, `ls`, `git`, and optionally `web_fetch`. `bash`, `edit`, and `write` are
+   never registered, so the model has no tool that can modify files. The `git` tool
+   only accepts fixed read-only actions and fixed arguments; `web_fetch` only performs
+   GET requests and refuses localhost/private addresses.
 3. Opening a tab captures a **read-only snapshot**: the last assistant reply on the
    current branch plus the user request before it. The snapshot is sent as part of the
    system prompt and is a copy; later changes in the main conversation are not synced
@@ -151,6 +156,9 @@ for subsequent model calls.
   at secrets you would not send to your model provider.
 - `grep` and `find` use `rg` / `fd`; like the main agent, pi may download them on first
   use if they are missing.
+- The `git` tool is deliberately narrow: it can inspect commits, diffs, files, and
+  history, but it cannot commit, checkout, stash, branch, tag, or run arbitrary git
+  commands.
 - Tool calls add tokens and latency. Toggle tools off with `Ctrl+G` when the snapshot is
   enough.
 - Token usage for side requests appears in the panel status line but is not counted

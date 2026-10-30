@@ -21,7 +21,7 @@
 - **自动附带只读快照**：打开 tab 时抓取最后一条助手回复 + 它之前的用户请求，
   作为 side model 的参考资料。
 - **只读工具**：快照不够时，侧边模型可以用 `read` / `grep` / `find` / `ls` 查看仓库和系统文件，
-  用 `web_fetch` 抓取具体 URL。没有 `bash`、`edit`、`write` 工具，所以不能修改文件。
+  用 `git` 读取提交历史与 commit 数据，用 `web_fetch` 抓取具体 URL。没有 `bash`、`edit`、`write` 工具，所以不能修改文件。
 - **可选写回**：`Ctrl+Y` 才把某一轮问答写回主对话（只有这一步会进入主上下文）。
 - **可单独选模型**：用便宜/快的模型做解释，不必占用主模型额度。
 - **双语界面**：默认跟随系统语言 —— 只有系统语言为中文时才用中文，其它语言一律英文。面板标题会显示当前模式和快捷键（`Language: Auto (EN) · Ctrl+L` / `语言：跟随系统（中文）· Ctrl+L`）；按 `Ctrl+L`（全屏模式下也可点击标签）在 跟随系统 / 英语 / 中文 之间循环，选择会写入 `aside.json`。
@@ -97,6 +97,7 @@ rm ~/.pi/agent/extensions/aside.ts
   "maxAnswerTokens": 4000,
   "notifyOnComplete": true,
   "tools": true,
+  "git": true,
   "network": true,
   "maxToolCalls": 12,
   "maxToolResultChars": 12000
@@ -109,8 +110,11 @@ rm ~/.pi/agent/extensions/aside.ts
 - `maxContextChars`：快照最多保留多少字符（超出时保留头 65% + 尾 35%，中间标注省略）。
 - `maxAnswerTokens`：单次侧边回答的 token 上限。
 - `notifyOnComplete`：面板关闭时，回答完成是否弹通知。
-- `tools`：启用只读工具（`read`、`grep`、`find`、`ls`），默认 `true`。
+- `tools`：启用只读工具（`read`、`grep`、`find`、`ls`、`git`），默认 `true`。
   在面板里按 `Ctrl+G` 可以按 tab 开关。
+- `git`：启用只读 git 工具，默认 `true`；只有 `tools` 开启时才会注册。
+  支持 `show`、`log`、`diff`、`blame`、`file`、`status`、`branches`、`tags`、`ls`，
+  不提供任意 git 命令执行。
 - `network`：启用 `web_fetch` 抓取具体 http(s) URL，默认 `true`；只有 `tools` 开启时才会注册。
   没有网页搜索。
 - `maxToolCalls`：每个问题最多调用多少次工具（默认 12）。用完后侧边模型用已有证据作答。
@@ -124,9 +128,10 @@ rm ~/.pi/agent/extensions/aside.ts
 1. 侧边问答有独立的消息数组，直接调用
    `ctx.modelRegistry.streamSimple(model, ...)`，**不经过** `session.prompt()`，
    所以不会往 session 文件里写任何消息。
-2. 侧边 agent 自己跑工具循环，工具集是封闭的：`read`、`grep`、`find`、`ls`，
+2. 侧边 agent 自己跑工具循环，工具集是封闭的：`read`、`grep`、`find`、`ls`、`git`，
    以及可选的 `web_fetch`。`bash`、`edit`、`write` 从来不会注册，所以模型没有任何
-   能修改文件的工具。`web_fetch` 只发 GET，并拒绝 localhost/内网地址。
+   能修改文件的工具。`git` 工具只接受固定的只读动作和固定参数；`web_fetch` 只发 GET，
+   并拒绝 localhost/内网地址。
 3. 打开 tab 时抓一份**只读快照**：当前分支最后一条助手回复 + 它之前的一条用户请求。
    快照作为 system prompt 的一部分发送，是副本；主对话后续的变化不会自动同步
    （需要 `Ctrl+R`）。
@@ -142,6 +147,8 @@ rm ~/.pi/agent/extensions/aside.ts
 - 读取范围没有限制在项目内：侧边模型能读 pi 进程能读的任何文件（和主代理一样）。
   它仍然不能写，但不要把不想发给模型提供商的密钥文件指给它。
 - `grep` 和 `find` 依赖 `rg` / `fd`；和主代理一样，缺失时 pi 可能会在首次使用时自动下载。
+- `git` 工具刻意做得很窄：可以看 commit、diff、文件和历史，但不能 commit、checkout、
+  stash、建分支/tag，也不能执行任意 git 命令。
 - 工具调用会增加 token 和延迟。只用快照就够时可以用 `Ctrl+G` 关掉。
 - 侧边请求的 token 用量显示在面板状态行，但不计入主 session 的用量统计。
 - 侧边历史保存在内存里；切换 session（`/new`、`/resume`、`/fork`）或退出 pi 后清空。
