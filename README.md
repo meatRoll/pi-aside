@@ -10,8 +10,14 @@ A good fit: the AI is writing a long document or running a task, and you want to
 
 ## Features
 
-- **Context isolation**: the side conversation has its own message array and calls
-  `ctx.modelRegistry.streamSimple()` directly. It bypasses `session.prompt()` and never writes to the session file.
+- **Context isolation**: every tab is a separate pi `AgentSession` with its own
+  message history and session file. Side requests never touch the main session file and
+  never go through the main session's `prompt()`.
+- **Persistent side sessions**: tabs are stored under
+  `~/.pi/agent/aside/sessions/<main-session-id>` and associated with the main session
+  via their `parentSession` header. Reopening the panel — or resuming the main session
+  with `/resume` — restores the tabs and their full Q&A history. Closing a tab deletes its
+  side session.
 - **No interruption**: side requests are independent. You can ask while the main agent is streaming; nothing is injected into the current run.
 - **Truly detachable**: `Esc` only hides the panel — answers keep streaming in the background. The footer shows progress and a notification appears when done. Multiple tabs can run in parallel (up to 9).
 - **Reading position preserved**: the panel is an overlay, so the main transcript does not move. Reopening it returns you to where you were.
@@ -71,7 +77,7 @@ To quote the conversation: select text in the main transcript (fullscreen mode, 
 | `Esc` | Close the panel (the request keeps running) |
 | `Ctrl+C` | Cancel the active tab's generation |
 | `Ctrl+N` | New tab |
-| `Ctrl+X` | Close the current tab |
+| `Ctrl+X` | Close the current tab and delete its side session |
 | `Shift+←` / `Shift+→` | Switch tabs |
 | `PageUp` / `PageDown` | Scroll the side answer |
 | `Alt+↑` / `Alt+↓` | Scroll one line |
@@ -84,6 +90,10 @@ To quote the conversation: select text in the main transcript (fullscreen mode, 
 | `Ctrl+Y` | Write the latest Q&A turn into the main conversation (**only this enters the main context**) |
 
 The mouse wheel also scrolls.
+
+Aside tabs are persisted as pi sessions. Reopen the panel after closing it, or resume the
+main session with `/resume`, and the tabs and their history come back. A tab only starts
+its side session after the first question.
 
 ## Configuration
 
@@ -129,41 +139,38 @@ Optional file: `~/.pi/agent/aside.json`
   Built-in tools already truncate large outputs; this is a second token budget.
 
 Aside behaves like the main conversation apart from the two deliberate limits: no
-`write`/`edit`/`bash` tools, and a separate message array that never touches the
+`write`/`edit`/`bash` tools, and a separate pi session that never touches the main
 session file. The model follows the main session (override with `model`), side
 requests use the main thinking level, and there is no tool-call budget: tools stay
 declared for the whole turn, so the provider keeps parsing tool calls.
 
-Compaction does not invent its own policy; it follows whatever manages the main
-conversation:
-
-- **pi-compactor owns compaction** (`~/.pi/agent/compactor/lifecycle.json` enabled): the
-  `trigger` / `target` from `~/.pi/agent/compactor/settings.json` are used, including the
-  repository layer and per-model rules, so the numbers match the main chat.
-- **Otherwise**: pi's own `compaction` settings (`enabled`, `reserveTokens`,
-  `keepRecentTokens`, `modelOverrides`).
-
-The summary itself comes from pi's summarizer (`generateSummary`), using the same model
-and thinking level as the main conversation. On a context-overflow error Aside folds once
-and retries that round, like the main chat. The panel keeps showing the full history;
-only the message array sent to the model is compacted.
+Each tab is a real pi session, so compaction is handled by pi itself: the side session
+uses the normal `compaction` settings (`enabled`, `reserveTokens`, `keepRecentTokens`,
+`modelOverrides`) and pi's automatic compaction/overflow recovery. Aside does not
+implement or mirror a compaction policy, and pi-compactor is not loaded into side
+sessions. The panel keeps showing the full history; pi compacts only what it sends to
+the model.
 
 ## How isolation works
 
-1. The side conversation has its own message array and calls
-   `ctx.modelRegistry.streamSimple(model, ...)` directly. It **does not** go through
-   `session.prompt()`, so no message is written to the session file.
+1. Each tab is a separate pi `AgentSession` with its own `SessionManager`, message
+   history, model state, and session file. It **does not** go through the main
+   session's `prompt()`, so no message is written to the main session file.
 2. The side agent runs its own tool loop with a closed set of tools: `read`, `grep`,
    `find`, `ls`, `git`, and optionally `web_fetch`. `bash`, `edit`, and `write` are
    never registered, so the model has no tool that can modify files. The `git` tool
    only accepts fixed read-only actions and fixed arguments; `web_fetch` only performs
    GET requests and refuses localhost/private addresses.
-3. Opening the panel captures a **read-only snapshot**: the last assistant reply on
+3. Side sessions live under `~/.pi/agent/aside/sessions/<main-session-id>`; their
+   `parentSession` header also points at the main session file. Aside restores the side
+   sessions belonging to the current main session when the panel opens. With
+   `--no-session`, side sessions are in-memory and are not restored.
+4. Opening the panel captures a **read-only snapshot**: the last assistant reply on
    the current branch plus the user request before it, and any text currently selected in
    the transcript. Both are sent as part of the system prompt and are copies; later
    changes in the main conversation are not synced automatically (use `Ctrl+R` for the
    snapshot; reselect and reopen for the quote).
-4. The panel is an overlay: the main transcript does not scroll or re-layout, so your
+5. The panel is an overlay: the main transcript does not scroll or re-layout, so your
    reading position stays where it was.
 
 The only action that writes back to the main conversation is `Ctrl+Y`. It adds an
@@ -190,13 +197,12 @@ for subsequent model calls.
   enough.
 - Token usage for side requests appears in the panel status line but is not counted
   in the main session's usage statistics.
-- Side history lives in memory. Switching sessions (`/new`, `/resume`, `/fork`) or
-  exiting pi clears it.
-- There is no separate side-context cap. The trigger is the main conversation's, so with
-  pi-compactor it is that config's `trigger` (a percentage or token count per model), and
-  without it, `contextWindow - reserveTokens` from the `compaction` settings. Retained
-  text follows `target` / `keepRecentTokens`. pi-compactor's session-scoped overrides are
-  in memory only and are not visible to Aside.
+- Side sessions use pi's native compaction and overflow recovery. pi-compactor settings
+  and session-scoped overrides apply to the main conversation only; they are not loaded
+  into the side sessions.
+- Side sessions are grouped by the main session id. A new main session (`/new`) starts
+  with fresh tabs, and `/fork` or `/clone` does not copy the side sessions; `/resume`
+  restores them.
 - TUI mode only. In RPC/print mode, `/aside` shows a hint instead.
 - `Ctrl+Shift+S` may be captured by some terminals; `/aside` always opens the panel.
 
