@@ -16,6 +16,7 @@ A good fit: the AI is writing a long document or running a task, and you want to
 - **Truly detachable**: `Esc` only hides the panel — answers keep streaming in the background. The footer shows progress and a notification appears when done. Multiple tabs can run in parallel (up to 9).
 - **Reading position preserved**: the panel is an overlay, so the main transcript does not move. Reopening it returns you to where you were.
 - **Automatic read-only snapshot**: opening a tab captures the last assistant reply and the user request before it as reference material for the side model.
+- **Selection quote**: select text in the main transcript, then open Aside; the excerpt is attached to the active tab and treated as the focus of the question. Select different text and reopen to replace it.
 - **Read-only tools**: when the snapshot is not enough, the side model can inspect the repo or system files with `read` / `grep` / `find` / `ls`, read git history and commit data with `git`, and fetch a URL with `web_fetch`. There is no `bash`, `edit`, or `write` tool, so it cannot modify files.
 - **Optional write-back**: only `Ctrl+Y` writes a Q&A turn into the main conversation. That is the only step that enters the main context.
 - **Independent model**: use a cheap/fast model for explanations without spending the main model's budget.
@@ -61,6 +62,8 @@ rm ~/.pi/agent/extensions/aside.ts
 
 You can use it while the main agent is streaming.
 
+To quote the conversation: select text in the main transcript (fullscreen mode, the default; Pi owns the selection), then press `Ctrl+Shift+S` or run `/aside`. The excerpt is attached to the active tab and stays there for its questions. Close the panel, select different text, and reopen to replace the quote. New tabs inherit the current quote; press `Alt+S` to toggle it off or on.
+
 | Key | Action |
 |---|---|
 | `Enter` | Send the question |
@@ -74,7 +77,8 @@ You can use it while the main agent is streaming.
 | `Alt+↑` / `Alt+↓` | Scroll one line |
 | `Ctrl+End` | Jump to the latest output |
 | `Ctrl+R` | Re-capture the main-conversation snapshot |
-| `Ctrl+T` | Toggle the snapshot (when off, the side model only sees your question) |
+| `Ctrl+T` | Toggle the snapshot (when off, the side model only sees your question and any selected quote) |
+| `Alt+S` | Toggle the selected-text quote for the current tab |
 | `Ctrl+G` | Toggle read-only tools for the current tab |
 | `Ctrl+L` | Cycle interface language: Auto / English / Chinese (saved to `aside.json`) |
 | `Ctrl+Y` | Write the latest Q&A turn into the main conversation (**only this enters the main context**) |
@@ -90,6 +94,7 @@ Optional file: `~/.pi/agent/aside.json`
   "language": "auto",
   "model": "provider/model-id",
   "maxContextChars": 24000,
+  "maxSelectionChars": 8000,
   "notifyOnComplete": true,
   "tools": true,
   "git": true,
@@ -107,6 +112,8 @@ Optional file: `~/.pi/agent/aside.json`
   written back to this file.
 - `maxContextChars`: maximum characters kept in the snapshot (when exceeded, keep the
   first 65% and the last 35%, with the omitted middle marked).
+- `maxSelectionChars`: maximum characters kept from the text selected in the main
+  conversation (default 8000; the middle is omitted when exceeded).
 - `maxAnswerTokens`: optional cap for a single side answer; when omitted the model's own
   output limit applies (same as the main conversation).
 - `notifyOnComplete`: whether to show a notification when an answer completes while
@@ -151,10 +158,11 @@ only the message array sent to the model is compacted.
    never registered, so the model has no tool that can modify files. The `git` tool
    only accepts fixed read-only actions and fixed arguments; `web_fetch` only performs
    GET requests and refuses localhost/private addresses.
-3. Opening a tab captures a **read-only snapshot**: the last assistant reply on the
-   current branch plus the user request before it. The snapshot is sent as part of the
-   system prompt and is a copy; later changes in the main conversation are not synced
-   automatically (use `Ctrl+R`).
+3. Opening the panel captures a **read-only snapshot**: the last assistant reply on
+   the current branch plus the user request before it, and any text currently selected in
+   the transcript. Both are sent as part of the system prompt and are copies; later
+   changes in the main conversation are not synced automatically (use `Ctrl+R` for the
+   snapshot; reselect and reopen for the quote).
 4. The panel is an overlay: the main transcript does not scroll or re-layout, so your
    reading position stays where it was.
 
@@ -174,6 +182,10 @@ for subsequent model calls.
 - The `git` tool is deliberately narrow: it can inspect commits, diffs, files, and
   history, but it cannot commit, checkout, stash, branch, tag, or run arbitrary git
   commands.
+- Selection quote requires fullscreen mode, where Pi owns mouse selection. In regular
+  mode the terminal owns the selection and Aside cannot read it.
+- A quoted selection is sent to the model provider, like the snapshot. Do not select
+  secrets you would not send to your provider.
 - Tool calls add tokens and latency. Toggle tools off with `Ctrl+G` when the snapshot is
   enough.
 - Token usage for side requests appears in the panel status line but is not counted

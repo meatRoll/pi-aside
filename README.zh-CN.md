@@ -20,6 +20,8 @@
 - **不挤走阅读位置**：overlay 面板，主 transcript 不动，再打开回到原位置。
 - **自动附带只读快照**：打开 tab 时抓取最后一条助手回复 + 它之前的用户请求，
   作为 side model 的参考资料。
+- **选中的文字会作为引用**：在主对话里选中文字后打开 Aside，片段会附到当前 tab，
+  并作为这次提问的重点。选中别的文字再打开即可替换。
 - **只读工具**：快照不够时，侧边模型可以用 `read` / `grep` / `find` / `ls` 查看仓库和系统文件，
   用 `git` 读取提交历史与 commit 数据，用 `web_fetch` 抓取具体 URL。没有 `bash`、`edit`、`write` 工具，所以不能修改文件。
 - **可选写回**：`Ctrl+Y` 才把某一轮问答写回主对话（只有这一步会进入主上下文）。
@@ -65,6 +67,11 @@ rm ~/.pi/agent/extensions/aside.ts
 
 主代理正在输出时也可以直接用。
 
+想引用主对话里的文字：先在主 transcript 里选中（全屏模式，默认；由 Pi 管理选区），
+再按 `Ctrl+Shift+S` 或执行 `/aside`。选中的片段会附到当前 tab，并在这个 tab 的后续
+提问里持续生效。关掉面板、重新选中别的文字再打开，就会替换掉旧引用；新建 tab 会继承
+当前引用，按 `Alt+S` 可以开关它。
+
 | 键 | 作用 |
 |---|---|
 | `Enter` | 发送问题 |
@@ -78,7 +85,8 @@ rm ~/.pi/agent/extensions/aside.ts
 | `Alt+↑` / `Alt+↓` | 单行滚动 |
 | `Ctrl+End` | 回到最新 |
 | `Ctrl+R` | 重新抓取主对话快照 |
-| `Ctrl+T` | 开关快照（关掉后侧边模型只看得到你的问题） |
+| `Ctrl+T` | 开关快照（关掉后侧边模型只看得到你的问题和选中的文字） |
+| `Alt+S` | 开关当前 tab 的选中文字引用 |
 | `Ctrl+G` | 开关当前 tab 的只读工具 |
 | `Ctrl+L` | 循环切换界面语言：跟随系统 / 英语 / 中文（写入 `aside.json`） |
 | `Ctrl+Y` | 把最近一轮问答写回主对话（**这一步才会进入主上下文**） |
@@ -94,6 +102,7 @@ rm ~/.pi/agent/extensions/aside.ts
   "language": "auto",
   "model": "provider/model-id",
   "maxContextChars": 24000,
+  "maxSelectionChars": 8000,
   "notifyOnComplete": true,
   "tools": true,
   "git": true,
@@ -106,6 +115,7 @@ rm ~/.pi/agent/extensions/aside.ts
 - `model`：侧边问答单独用的模型；不填则跟随主对话当前模型。
   也可以随时用 `/aside-model` 选择，选择结果会写回这个文件。
 - `maxContextChars`：快照最多保留多少字符（超出时保留头 65% + 尾 35%，中间标注省略）。
+- `maxSelectionChars`：主对话中选中的文字最多保留多少字符（默认 8000；超出时中间标注省略）。
 - `maxAnswerTokens`：可选，单次侧边回答的 token 上限；不填则用模型自己的输出上限（和主对话一致）。
 - `notifyOnComplete`：面板关闭时，回答完成是否弹通知。
 - `tools`：启用只读工具（`read`、`grep`、`find`、`ls`、`git`），默认 `true`。
@@ -143,9 +153,9 @@ overflow 报错时，aside 会折叠一次并重试这一轮，和主对话一�
    以及可选的 `web_fetch`。`bash`、`edit`、`write` 从来不会注册，所以模型没有任何
    能修改文件的工具。`git` 工具只接受固定的只读动作和固定参数；`web_fetch` 只发 GET，
    并拒绝 localhost/内网地址。
-3. 打开 tab 时抓一份**只读快照**：当前分支最后一条助手回复 + 它之前的一条用户请求。
-   快照作为 system prompt 的一部分发送，是副本；主对话后续的变化不会自动同步
-   （需要 `Ctrl+R`）。
+3. 打开面板时抓一份**只读快照**：当前分支最后一条助手回复 + 它之前的一条用户请求，
+   外加主对话里当前选中的文字。它们都作为 system prompt 的一部分发送，是副本；
+   主对话后续的变化不会自动同步（快照按 `Ctrl+R` 刷新；选中文字需要重新选中并打开）。
 4. 面板是 overlay：主 transcript 不滚动、不重绘位置，阅读位置保持不变。
 
 唯一会写回主对话的操作是 `Ctrl+Y`，它用 `pi.sendMessage()` 添加一条
@@ -160,6 +170,9 @@ overflow 报错时，aside 会折叠一次并重试这一轮，和主对话一�
 - `grep` 和 `find` 依赖 `rg` / `fd`；和主代理一样，缺失时 pi 可能会在首次使用时自动下载。
 - `git` 工具刻意做得很窄：可以看 commit、diff、文件和历史，但不能 commit、checkout、
   stash、建分支/tag，也不能执行任意 git 命令。
+- 引用选中文字需要全屏模式（由 Pi 管理鼠标选区）。普通模式下选区归终端管理，
+  Aside 读不到。
+- 选中的文字和快照一样会发给模型提供商。不要把不想发给提供商的密钥选进来。
 - 工具调用会增加 token 和延迟。只用快照就够时可以用 `Ctrl+G` 关掉。
 - 侧边请求的 token 用量显示在面板状态行，但不计入主 session 的用量统计。
 - 侧边历史保存在内存里；切换 session（`/new`、`/resume`、`/fork`）或退出 pi 后清空。
