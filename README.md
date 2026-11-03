@@ -16,7 +16,7 @@ A good fit: the AI is writing a long document or running a task, and you want to
 - **Truly detachable**: `Esc` only hides the panel — answers keep streaming in the background. The footer shows progress and a notification appears when done. Multiple tabs can run in parallel (up to 9).
 - **Reading position preserved**: the panel is an overlay, so the main transcript does not move. Reopening it returns you to where you were.
 - **Automatic read-only snapshot**: opening a tab captures the last assistant reply and the user request before it as reference material for the side model.
-- **Selection quote**: select text in the main transcript, then open Aside; the excerpt is attached to the active tab and treated as the focus of the question. Select different text and reopen to replace it.
+- **Selection quote**: select text in the main transcript, then open Aside; the excerpt gets a tab of its own (an untouched tab is reused) and is treated as the focus of the question. The selection is consumed on open, so reopening without selecting again does not repeat it; `Alt+S` toggles the quote for that tab.
 - **Read-only tools**: when the snapshot is not enough, the side model can inspect the repo or system files with `read` / `grep` / `find` / `ls`, read git history and commit data with `git`, and fetch a URL with `web_fetch`. There is no `bash`, `edit`, or `write` tool, so it cannot modify files.
 - **Optional write-back**: only `Ctrl+Y` writes a Q&A turn into the main conversation. That is the only step that enters the main context.
 - **Independent model**: use a cheap/fast model for explanations without spending the main model's budget.
@@ -62,7 +62,7 @@ rm ~/.pi/agent/extensions/aside.ts
 
 You can use it while the main agent is streaming.
 
-To quote the conversation: select text in the main transcript (fullscreen mode, the default; Pi owns the selection), then press `Ctrl+Shift+S` or run `/aside`. The excerpt is attached to the active tab and stays there for its questions. Close the panel, select different text, and reopen to replace the quote. New tabs inherit the current quote; press `Alt+S` to toggle it off or on.
+To quote the conversation: select text in the main transcript (fullscreen mode, the default; Pi owns the selection), then press `Ctrl+Shift+S` or run `/aside`. The excerpt opens in a tab of its own and stays there for that tab's questions, and the selection is consumed — reopening the panel without selecting anything keeps the current tab instead of quoting the old text again. New tabs created with `Ctrl+N` inherit the current quote; press `Alt+S` to toggle it off or on.
 
 | Key | Action |
 |---|---|
@@ -183,7 +183,8 @@ for subsequent model calls.
   history, but it cannot commit, checkout, stash, branch, tag, or run arbitrary git
   commands.
 - Selection quote requires fullscreen mode, where Pi owns mouse selection. In regular
-  mode the terminal owns the selection and Aside cannot read it.
+  mode the terminal owns the selection and Aside cannot read it. A quoted selection is
+  cleared when the panel opens, so it is quoted once; select again to quote again.
 - A quoted selection is sent to the model provider, like the snapshot. Do not select
   secrets you would not send to your provider.
 - Tool calls add tokens and latency. Toggle tools off with `Ctrl+G` when the snapshot is

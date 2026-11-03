@@ -15,8 +15,10 @@
  *   the preceding user request) and sends it as part of the system prompt. The
  *   snapshot is a copy; refresh it with Ctrl+R when the main chat changes.
  * - Text selected in the main transcript is captured when the panel opens and is
- *   sent as a quoted excerpt. This works in fullscreen mode, where Pi owns the
- *   selection; regular mode leaves selection to the terminal.
+ *   sent as a quoted excerpt. The quote gets a tab of its own (a pristine tab is
+ *   reused), and the selection is cleared on open, so reopening without a new
+ *   selection does not quote the old text again. This works in fullscreen mode,
+ *   where Pi owns the selection; regular mode leaves selection to the terminal.
  * - The panel is an overlay: the transcript does not scroll or reflow.
  * - Everything else follows the main conversation: the side model defaults to the
  *   main model, the thinking level is the main session's, and the replay is
@@ -159,7 +161,7 @@ interface UiMessages {
 	snapshotAnswerHeading: string;
 	snapshotLabel: (withRequest: boolean) => string;
 
-	noteSelectionAttached: (chars: string) => string;
+	noteSelectionDropped: (max: number) => string;
 	noteSelectionEnabled: string;
 	noteSelectionDisabled: string;
 	noteNoSelection: string;
@@ -253,7 +255,7 @@ const EN_MESSAGES: UiMessages = {
 	snapshotAnswerHeading: "### Assistant reply the user is reading",
 	snapshotLabel: (withRequest) => (withRequest ? "last reply + preceding request" : "last reply"),
 
-	noteSelectionAttached: (chars) => `Selected text attached: ${chars} chars`,
+	noteSelectionDropped: (max) => `Selected text not attached: at most ${max} tabs. Close one with Ctrl+X first`,
 	noteSelectionEnabled: "Selected-text quote enabled",
 	noteSelectionDisabled: "Selected-text quote disabled",
 	noteNoSelection: "This tab has no selected text",
@@ -350,7 +352,7 @@ const ZH_MESSAGES: UiMessages = {
 	snapshotAnswerHeading: "### 用户正在阅读的助手回复",
 	snapshotLabel: (withRequest) => (withRequest ? "最后一条回复 + 上一条请求" : "最后一条回复"),
 
-	noteSelectionAttached: (chars) => `已附上选中的文字：${chars} 字符`,
+	noteSelectionDropped: (max) => `选中的文字没有附加：最多 ${max} 个 tab，先用 Ctrl+X 关掉一个`,
 	noteSelectionEnabled: "已启用选中文字引用",
 	noteSelectionDisabled: "已关闭选中文字引用",
 	noteNoSelection: "当前 tab 没有选中的文字",
@@ -644,6 +646,19 @@ function captureSelection(tui: TUI, maxChars: number): SelectionQuote | undefine
 	}
 }
 
+/**
+ * Drop the transcript selection once it has been quoted. Without this the host keeps the
+ * highlight, and the next open would quote the same text again without the user selecting
+ * anything. Hosts without selection ownership simply keep their selection.
+ */
+function consumeSelection(tui: TUI): void {
+	try {
+		(tui as TUI & { resetTextSelection?: () => void }).resetTextSelection?.();
+	} catch {
+		// Nothing to clear; the host owns the selection.
+	}
+}
+
 function clipMiddle(text: string, maxChars: number): { text: string; truncated: boolean } {
 	if (text.length <= maxChars) return { text, truncated: false };
 	const headLength = Math.floor(maxChars * 0.65);
@@ -884,6 +899,27 @@ function createTab(
 		unread: false,
 		createdAt: Date.now(),
 	};
+}
+
+/**
+ * Pick the tab that owns a freshly selected quote. A pristine tab (no turns, no draft) is
+ * reused, so opening aside on an untouched panel does not pile up empty tabs; anything else
+ * gets a tab of its own, so the quote never lands in an unrelated conversation. Returns
+ * undefined when every tab slot is taken and the quote has to wait for a free one.
+ */
+function tabForSelection(runtime: SessionRuntime, selection: SelectionQuote): AsideTab | undefined {
+	const current = activeTab(runtime);
+	if (current.turns.length === 0 && !current.draft.trim()) {
+		// Reusing an empty tab means its snapshot may be older than the selected text.
+		current.snapshot = runtime.captureSnapshot();
+		current.useContext = current.snapshot !== undefined;
+		return current;
+	}
+	if (runtime.tabs.length >= DEFAULTS.maxTabs) return undefined;
+	const tab = createTab(runtime, true, selection, true);
+	runtime.tabs.push(tab);
+	runtime.activeId = tab.id;
+	return tab;
 }
 
 function getRuntime(
@@ -2757,17 +2793,20 @@ export default function asideExtension(pi: ExtensionAPI) {
 
 		await ctx.ui.custom<void>(
 			(tui, theme, _keybindings, done) => {
-				const tab = activeTab(runtime);
 				const selection = captureSelection(
 					tui,
 					config.maxSelectionChars ?? DEFAULTS.maxSelectionChars,
 				);
 				let initialNote: string | undefined;
-				if (selection && selection.text !== tab.selection?.text) {
-					tab.selection = selection;
-					tab.useSelection = true;
-					if (tab.turns.length > 0) {
-						initialNote = t().noteSelectionAttached(formatTokens(selection.chars));
+				if (selection) {
+					const tab = tabForSelection(runtime, selection);
+					if (tab) {
+						tab.selection = selection;
+						tab.useSelection = true;
+						// Quoting consumes the selection: reopening without a new selection keeps the current tab.
+						consumeSelection(tui);
+					} else {
+						initialNote = t().noteSelectionDropped(DEFAULTS.maxTabs);
 					}
 				}
 
