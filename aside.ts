@@ -39,7 +39,7 @@
  * - Ctrl+Shift+S                   shortcut to open the panel
  * - Ctrl+L                         cycle Auto/English/Chinese in the panel
  * - Ctrl+G                         toggle read-only tools for the active tab
- * - Ctrl+Q                         toggle the selected-text quote for the active tab
+ * - F2                             toggle the selected-text quote for the active tab
  */
 
 import { execFile, execFileSync } from "node:child_process";
@@ -313,7 +313,7 @@ const EN_MESSAGES: UiMessages = {
 		"enter send · shift+enter newline · esc close (keeps running) · ctrl+c cancel",
 		"ctrl+y write back · ctrl+r refresh snapshot · ctrl+t snapshot · ctrl+g tools",
 		"shift+←/→ tabs · ctrl+n new · ctrl+x close · pgup/pgdn scroll",
-		"select text in the main chat before opening aside · ctrl+q toggles the quote",
+		"select text in the main chat before opening aside · f2 toggles the quote",
 	],
 
 	emptyAsk: " Ask about the output in the main conversation.",
@@ -410,7 +410,7 @@ const ZH_MESSAGES: UiMessages = {
 		"enter 发送 · shift+enter 换行 · esc 关闭（后台继续）· ctrl+c 取消生成",
 		"ctrl+y 写回主对话 · ctrl+r 刷新快照 · ctrl+t 快照 · ctrl+g 工具开关",
 		"shift+←/→ 切换 tab · ctrl+n 新建 · ctrl+x 关闭 · pgup/pgdn 滚动",
-		"先在主对话里选中文字再打开 aside · ctrl+q 开关引用",
+		"先在主对话里选中文字再打开 aside · f2 开关引用",
 	],
 
 	emptyAsk: " 在这里问关于主对话输出的问题。",
@@ -926,7 +926,7 @@ function tabForSelection(runtime: SessionRuntime, selection: SelectionQuote): As
 /**
  * Drop a quote that has just been sent. A selection is worth exactly one request: keeping it
  * would re-send it with every later question in the tab. A quote the user toggled off with
- * Ctrl+Q is left alone, because it has not been used yet.
+ * F2 is left alone, because it has not been used yet.
  */
 function consumeTabSelection(tab: AsideTab): void {
 	if (!tab.useSelection) return;
@@ -2288,7 +2288,7 @@ class AsidePanel implements Component, Focusable {
 			this.toggleContext();
 			return;
 		}
-		if (matchesKey(data, "ctrl+q")) {
+		if (matchesKey(data, "f2")) {
 			this.toggleSelection();
 			return;
 		}

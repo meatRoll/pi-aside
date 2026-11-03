@@ -16,7 +16,7 @@ A good fit: the AI is writing a long document or running a task, and you want to
 - **Truly detachable**: `Esc` only hides the panel — answers keep streaming in the background. The footer shows progress and a notification appears when done. Multiple tabs can run in parallel (up to 9).
 - **Reading position preserved**: the panel is an overlay, so the main transcript does not move. Reopening it returns you to where you were.
 - **Automatic read-only snapshot**: opening a tab captures the last assistant reply and the user request before it as reference material for the side model.
-- **Selection quote**: select text in the main transcript, then open Aside; the excerpt gets a tab of its own (an untouched tab is reused) and is sent with exactly one question, then dropped. The selection is consumed on open too, so reopening without selecting again does not repeat it; `Ctrl+Q` can exclude the quote from the next question.
+- **Selection quote**: select text in the main transcript, then open Aside; the excerpt gets a tab of its own (an untouched tab is reused) and is sent with exactly one question, then dropped. The selection is consumed on open too, so reopening without selecting again does not repeat it; `F2` can exclude the quote from the next question.
 - **Read-only tools**: when the snapshot is not enough, the side model can inspect the repo or system files with `read` / `grep` / `find` / `ls`, read git history and commit data with `git`, and fetch a URL with `web_fetch`. There is no `bash`, `edit`, or `write` tool, so it cannot modify files.
 - **Optional write-back**: only `Ctrl+Y` writes a Q&A turn into the main conversation. That is the only step that enters the main context.
 - **Independent model**: use a cheap/fast model for explanations without spending the main model's budget.
@@ -62,7 +62,7 @@ rm ~/.pi/agent/extensions/aside.ts
 
 You can use it while the main agent is streaming.
 
-To quote the conversation: select text in the main transcript (fullscreen mode, the default; Pi owns the selection), then press `Ctrl+Shift+S` or run `/aside`. The excerpt opens in a tab of its own and is sent with the first question in that tab, then dropped — it is never inherited by new tabs, and once sent it does not come back when you reopen the panel. The selection is consumed on open, so reopening without selecting anything keeps the current tab instead of quoting the old text again. `Ctrl+Q` excludes the quote from the next question if you do not want it.
+To quote the conversation: select text in the main transcript (fullscreen mode, the default; Pi owns the selection), then press `Ctrl+Shift+S` or run `/aside`. The excerpt opens in a tab of its own and is sent with the first question in that tab, then dropped — it is never inherited by new tabs, and once sent it does not come back when you reopen the panel. The selection is consumed on open, so reopening without selecting anything keeps the current tab instead of quoting the old text again. `F2` excludes the quote from the next question if you do not want it.
 
 | Key | Action |
 |---|---|
@@ -78,7 +78,7 @@ To quote the conversation: select text in the main transcript (fullscreen mode, 
 | `Ctrl+End` | Jump to the latest output |
 | `Ctrl+R` | Re-capture the main-conversation snapshot |
 | `Ctrl+T` | Toggle the snapshot (when off, the side model only sees your question and any selected quote) |
-| `Ctrl+Q` | Toggle the selected-text quote for the current tab |
+| `F2` | Toggle the selected-text quote for the current tab |
 | `Ctrl+G` | Toggle read-only tools for the current tab |
 | `Ctrl+L` | Cycle interface language: Auto / English / Chinese (saved to `aside.json`) |
 | `Ctrl+Y` | Write the latest Q&A turn into the main conversation (**only this enters the main context**) |
