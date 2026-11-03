@@ -39,7 +39,8 @@
  * - Ctrl+Shift+S                   shortcut to open the panel
  * - Ctrl+L                         cycle Auto/English/Chinese in the panel
  * - Ctrl+G                         toggle read-only tools for the active tab
- * - Ctrl+Shift+Q                   toggle the selected-text quote for the active tab
+ * - Ctrl+\                         command mode: q quote, t snapshot, r refresh snapshot,
+ *                                  g tools, y write back, l language; esc cancels
  */
 
 import { execFile, execFileSync } from "node:child_process";
@@ -193,6 +194,7 @@ interface UiMessages {
 	noteToolsDisabled: string;
 	noteNothingToPromote: string;
 	notePromoted: string;
+	noteUnknownCommand: string;
 
 	labelNoModel: string;
 	labelReadOnly: string;
@@ -213,8 +215,11 @@ interface UiMessages {
 	statusTab: (index: number, count: number) => string;
 	statusTools: (count: number) => string;
 	statusToolsOff: string;
+	statusToolsOn: string;
+	statusCommandMode: string;
 
 	hints: readonly string[];
+	commandHints: readonly string[];
 
 	emptyAsk: string;
 	emptyReadOnly: string;
@@ -288,6 +293,7 @@ const EN_MESSAGES: UiMessages = {
 	noteToolsDisabled: "Read-only tools disabled; answering from the snapshot only",
 	noteNothingToPromote: "This tab has no answer to write back",
 	notePromoted: "Written to the main chat (now part of the main context)",
+	noteUnknownCommand: "Unknown command; press ctrl+\\ again for the list",
 
 	labelNoModel: "no model",
 	labelReadOnly: "read-only",
@@ -308,12 +314,20 @@ const EN_MESSAGES: UiMessages = {
 	statusTab: (index, count) => `tab ${index}/${count}`,
 	statusTools: (count) => `${count} ${count === 1 ? "tool" : "tools"}`,
 	statusToolsOff: "tools off",
+	statusToolsOn: "tools on",
+	statusCommandMode: "⌘ command",
 
 	hints: [
 		"enter send · shift+enter newline · esc close (keeps running) · ctrl+c cancel",
 		"ctrl+y write back · ctrl+r refresh snapshot · ctrl+t snapshot · ctrl+g tools",
 		"shift+←/→ tabs · ctrl+n new · ctrl+x close · pgup/pgdn scroll",
-		"select text in the main chat before opening aside · ctrl+shift+q toggles the quote",
+		"select text in the main chat before opening aside · ctrl+\\ for command mode",
+	],
+
+	commandHints: [
+		"command mode · q quote · t snapshot · r refresh snapshot · g tools · y write back · l language",
+		"esc cancels · the direct shortcuts still work when this mode is closed",
+		"mouse: click a tab to switch · click snapshot / quote / tools in the status line",
 	],
 
 	emptyAsk: " Ask about the output in the main conversation.",
@@ -385,6 +399,7 @@ const ZH_MESSAGES: UiMessages = {
 	noteToolsDisabled: "已关闭只读工具，只用快照回答",
 	noteNothingToPromote: "这个 tab 还没有可写入的回答",
 	notePromoted: "已写入主对话（会进入主上下文）",
+	noteUnknownCommand: "未知指令，再按一次 ctrl+\\ 查看列表",
 
 	labelNoModel: "无模型",
 	labelReadOnly: "只读",
@@ -405,12 +420,20 @@ const ZH_MESSAGES: UiMessages = {
 	statusTab: (index, count) => `tab ${index}/${count}`,
 	statusTools: (count) => `${count} 次工具`,
 	statusToolsOff: "工具关闭",
+	statusToolsOn: "工具开启",
+	statusCommandMode: "⌘ 指令",
 
 	hints: [
 		"enter 发送 · shift+enter 换行 · esc 关闭（后台继续）· ctrl+c 取消生成",
 		"ctrl+y 写回主对话 · ctrl+r 刷新快照 · ctrl+t 快照 · ctrl+g 工具开关",
 		"shift+←/→ 切换 tab · ctrl+n 新建 · ctrl+x 关闭 · pgup/pgdn 滚动",
-		"先在主对话里选中文字再打开 aside · ctrl+shift+q 开关引用",
+		"先在主对话里选中文字再打开 aside · ctrl+\\ 进入指令模式",
+	],
+
+	commandHints: [
+		"指令模式 · q 引用 · t 快照 · r 刷新快照 · g 工具 · y 写回主对话 · l 语言",
+		"esc 取消 · 退出后直接快捷键仍然可用",
+		"鼠标：点 tab 切换 · 点状态栏的快照 / 引用 / 工具同样生效",
 	],
 
 	emptyAsk: " 在这里问关于主对话输出的问题。",
@@ -925,8 +948,8 @@ function tabForSelection(runtime: SessionRuntime, selection: SelectionQuote): As
 
 /**
  * Drop a quote that has just been sent. A selection is worth exactly one request: keeping it
- * would re-send it with every later question in the tab. A quote the user toggled off with
- * Ctrl+Shift+Q is left alone, because it has not been used yet.
+ * would re-send it with every later question in the tab. A quote the user turned off in
+ * command mode (q) is left alone, because it has not been used yet.
  */
 function consumeTabSelection(tab: AsideTab): void {
 	if (!tab.useSelection) return;
@@ -2196,6 +2219,14 @@ interface PanelOptions {
 	onDone: () => void;
 }
 
+/** A clickable region of the panel, in component coordinates. */
+interface PanelHit {
+	x: number;
+	y: number;
+	width: number;
+	run: () => void;
+}
+
 class AsidePanel implements Component, Focusable {
 	focused = false;
 
@@ -2211,7 +2242,9 @@ class AsidePanel implements Component, Focusable {
 	private note: string | undefined;
 	private initialQuestion: string | undefined;
 	private disposed = false;
-	private languageHit: { x: number; width: number } | undefined;
+	private commandMode = false;
+	/** Clickable regions recorded while rendering; rebuilt on every frame. */
+	private hits: PanelHit[] = [];
 
 	constructor(options: PanelOptions) {
 		this.runtime = options.runtime;
@@ -2256,6 +2289,15 @@ class AsidePanel implements Component, Focusable {
 	// Keyboard --------------------------------------------------------------
 
 	handleInput(data: string): void {
+		if (this.commandMode) {
+			this.runCommand(data);
+			return;
+		}
+		if (matchesKey(data, "ctrl+\\")) {
+			this.commandMode = true;
+			this.requestRender();
+			return;
+		}
 		if (matchesKey(data, "escape")) {
 			this.close();
 			return;
@@ -2286,12 +2328,6 @@ class AsidePanel implements Component, Focusable {
 		}
 		if (matchesKey(data, "ctrl+t")) {
 			this.toggleContext();
-			return;
-		}
-		// Ctrl+Shift+Q is distinct only on terminals that disambiguate modifiers; legacy
-		// terminals send Ctrl+Q for both, so accept it as the fallback.
-		if (matchesKey(data, "ctrl+shift+q") || matchesKey(data, "ctrl+q")) {
-			this.toggleSelection();
 			return;
 		}
 		if (matchesKey(data, "ctrl+g")) {
@@ -2344,14 +2380,33 @@ class AsidePanel implements Component, Focusable {
 			this.scrollBy(event.wheelDelta);
 			return { handled: true };
 		}
-		if (event.type === "click" && event.button === "left" && event.y === 1 && this.languageHit) {
-			const { x, width } = this.languageHit;
-			if (event.x >= x && event.x < x + width) {
-				this.toggleLanguage();
+		if (event.type === "click" && event.button === "left") {
+			const hit = this.hits.find(
+				(candidate) => candidate.y === event.y && event.x >= candidate.x && event.x < candidate.x + candidate.width,
+			);
+			if (hit) {
+				hit.run();
 				return { handled: true };
 			}
 		}
 		return undefined;
+	}
+
+	/** Execute a key pressed in command mode; any unknown key just leaves the mode. */
+	private runCommand(data: string): void {
+		this.commandMode = false;
+		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c") || matchesKey(data, "ctrl+\\")) {
+			this.requestRender();
+			return;
+		}
+		if (matchesKey(data, "q")) this.toggleSelection();
+		else if (matchesKey(data, "t")) this.toggleContext();
+		else if (matchesKey(data, "r")) this.refreshSnapshot();
+		else if (matchesKey(data, "g")) this.toggleTools();
+		else if (matchesKey(data, "y")) this.promote();
+		else if (matchesKey(data, "l")) this.toggleLanguage();
+		else this.setStatusNote(t().noteUnknownCommand);
+		this.requestRender();
 	}
 
 	submitInitialQuestion(): void {
@@ -2449,9 +2504,16 @@ class AsidePanel implements Component, Focusable {
 			this.setStatusNote(t().noteSingleTab);
 			return;
 		}
-		this.saveDraft();
 		const index = runtime.tabs.indexOf(activeTab(runtime));
-		const next = runtime.tabs[(index + delta + runtime.tabs.length) % runtime.tabs.length]!;
+		this.activateTab((index + delta + runtime.tabs.length) % runtime.tabs.length);
+	}
+
+	/** Switch to a tab by index; used by tab clicks. */
+	private activateTab(index: number): void {
+		const runtime = this.runtime;
+		const next = runtime.tabs[index];
+		if (!next || next.id === runtime.activeId) return;
+		this.saveDraft();
 		runtime.activeId = next.id;
 		next.unread = false;
 		this.loadDraft();
@@ -2541,9 +2603,11 @@ class AsidePanel implements Component, Focusable {
 		const panelRows = Math.max(14, Math.min(rows - 2, 36));
 		const innerWidth = Math.max(24, width - 2);
 		const border = (text: string) => theme.fg("border", text);
+		this.hits = [];
 
 		this.editor.focused = this.focused;
 		const editorLines = this.editor.render(innerWidth);
+		const hintLines = this.commandMode ? t().commandHints : t().hints;
 
 		const chrome =
 			1 + // top border
@@ -2551,7 +2615,7 @@ class AsidePanel implements Component, Focusable {
 			1 + // separator
 			1 + // status
 			editorLines.length +
-			t().hints.length +
+			hintLines.length +
 			1; // bottom border
 		const viewport = Math.max(3, panelRows - chrome);
 
@@ -2561,7 +2625,7 @@ class AsidePanel implements Component, Focusable {
 
 		const titleLine = this.renderTitle(innerWidth);
 		const tabLine = this.renderTabs(innerWidth);
-		const statusLine = this.renderStatus(innerWidth);
+		const statusLine = this.renderStatus(innerWidth, 4 + viewport);
 
 		const lines: string[] = [];
 		lines.push(border(`╭${"─".repeat(innerWidth)}╮`));
@@ -2571,7 +2635,7 @@ class AsidePanel implements Component, Focusable {
 		for (const line of windowLines) lines.push(border("│") + padToWidth(line, innerWidth) + border("│"));
 		lines.push(border("│") + padToWidth(statusLine, innerWidth) + border("│"));
 		for (const line of editorLines) lines.push(border("│") + padToWidth(line, innerWidth) + border("│"));
-		for (const hint of t().hints) {
+		for (const hint of hintLines) {
 			lines.push(border("│") + padToWidth(theme.fg("dim", hint), innerWidth) + border("│"));
 		}
 		lines.push(border(`╰${"─".repeat(innerWidth)}╯`));
@@ -2595,7 +2659,9 @@ class AsidePanel implements Component, Focusable {
 				: theme.fg("dim", t().scrollLatest);
 		const right = `${badge}  ${scroll}`;
 		const start = width - visibleWidth(right);
-		this.languageHit = start >= 0 ? { x: 1 + start, width: visibleWidth(badge) } : undefined;
+		if (start >= 0) {
+			this.hits.push({ x: 1 + start, y: 1, width: visibleWidth(badge), run: () => this.toggleLanguage() });
+		}
 		return spread(left, right, width);
 	}
 
@@ -2603,71 +2669,102 @@ class AsidePanel implements Component, Focusable {
 		const theme = this.theme;
 		const runtime = this.runtime;
 		const parts: string[] = [];
+		let x = 1; // the line starts with one space
 		runtime.tabs.forEach((tab, index) => {
 			const active = tab.id === runtime.activeId;
 			const marker = tab.status !== "idle" ? "● " : tab.unread ? "✓ " : "";
 			const label = `${index + 1} ${tabTitle(tab, index)}`;
 			const text = ` ${marker}${label} `;
+			const textWidth = visibleWidth(text);
+			if (x + textWidth <= width) {
+				this.hits.push({ x, y: 2, width: textWidth, run: () => this.activateTab(index) });
+			}
 			parts.push(active ? theme.bg("selectedBg", theme.fg("text", text)) : theme.fg("muted", text));
+			x += textWidth + 1; // separator between tabs
 		});
 		const joined = parts.join(theme.fg("borderMuted", "│"));
 		return truncateToWidth(` ${joined}`, width, "…");
 	}
 
-	private renderStatus(width: number): string {
+	private renderStatus(width: number, y: number): string {
 		const theme = this.theme;
 		const runtime = this.runtime;
 		const tab = activeTab(runtime);
-		const parts: string[] = [];
+		const segments: { text: string; run?: () => void }[] = [];
 
-		if (tab.status === "thinking") parts.push(theme.fg("accent", t().statusWaiting));
-		else if (tab.status === "compacting") parts.push(theme.fg("accent", t().statusCompacting));
+		if (this.commandMode) segments.push({ text: theme.fg("accent", t().statusCommandMode) });
+
+		if (tab.status === "thinking") segments.push({ text: theme.fg("accent", t().statusWaiting) });
+		else if (tab.status === "compacting") segments.push({ text: theme.fg("accent", t().statusCompacting) });
 		else if (tab.status === "streaming") {
 			const last = tab.turns[tab.turns.length - 1];
 			const thinking = last?.answer ? 0 : (last?.thinkingChars ?? 0);
-			parts.push(
-				thinking > 0
-					? theme.fg("accent", t().statusThinking(formatTokens(thinking)))
-					: theme.fg("accent", t().statusGenerating),
-			);
-		} else parts.push(theme.fg("dim", t().statusIdle));
+			segments.push({
+				text:
+					thinking > 0
+						? theme.fg("accent", t().statusThinking(formatTokens(thinking)))
+						: theme.fg("accent", t().statusGenerating),
+			});
+		} else segments.push({ text: theme.fg("dim", t().statusIdle) });
 
 		const last = tab.turns[tab.turns.length - 1];
 		if (last?.startedAt && tab.status !== "idle") {
-			parts.push(theme.fg("dim", `${Math.max(1, Math.round((Date.now() - last.startedAt) / 1000))}s`));
+			segments.push({ text: theme.fg("dim", `${Math.max(1, Math.round((Date.now() - last.startedAt) / 1000))}s`) });
 		}
-		if (this.note) parts.push(theme.fg("muted", this.note));
+		if (this.note) segments.push({ text: theme.fg("muted", this.note) });
 
-		if (tab.useContext && tab.snapshot) {
-			parts.push(theme.fg("dim", t().statusSnapshot(formatTokens(tab.snapshot.chars), tab.snapshot.truncated)));
-		} else {
-			parts.push(theme.fg("warning", t().statusSnapshotOff));
-		}
+		segments.push(
+			tab.useContext && tab.snapshot
+				? {
+						text: theme.fg("dim", t().statusSnapshot(formatTokens(tab.snapshot.chars), tab.snapshot.truncated)),
+						run: () => this.toggleContext(),
+					}
+				: { text: theme.fg("warning", t().statusSnapshotOff), run: () => this.toggleContext() },
+		);
 		if (tab.selection) {
-			parts.push(
-				theme.fg(
+			segments.push({
+				text: theme.fg(
 					tab.useSelection ? "dim" : "warning",
 					tab.useSelection
 						? t().statusSelection(formatTokens(tab.selection.chars), tab.selection.truncated)
 						: t().statusSelectionOff,
 				),
-			);
+				run: () => this.toggleSelection(),
+			});
 		}
 		const toolCalls = tab.turns.reduce(
 			(total, turn) => total + turn.parts.filter((part) => part.kind === "tool").length,
 			0,
 		);
-		if (!tab.useTools) parts.push(theme.fg("warning", t().statusToolsOff));
-		else if (toolCalls > 0) parts.push(theme.fg("dim", t().statusTools(toolCalls)));
+		segments.push({
+			text: !tab.useTools
+				? theme.fg("warning", t().statusToolsOff)
+				: theme.fg("dim", toolCalls > 0 ? t().statusTools(toolCalls) : t().statusToolsOn),
+			run: () => this.toggleTools(),
+		});
 		if (tab.usageIn || tab.usageOut) {
-			parts.push(theme.fg("dim", `↑${formatTokens(tab.usageIn)} ↓${formatTokens(tab.usageOut)}`));
+			segments.push({ text: theme.fg("dim", `↑${formatTokens(tab.usageIn)} ↓${formatTokens(tab.usageOut)}`) });
 		}
-		if (tab.turns.length > 0) parts.push(theme.fg("dim", t().statusTurns(tab.turns.length)));
+		if (tab.turns.length > 0) segments.push({ text: theme.fg("dim", t().statusTurns(tab.turns.length)) });
 		if (runtime.tabs.length > 1) {
-			parts.push(theme.fg("dim", t().statusTab(runtime.tabs.indexOf(tab) + 1, runtime.tabs.length)));
+			segments.push({ text: theme.fg("dim", t().statusTab(runtime.tabs.indexOf(tab) + 1, runtime.tabs.length)) });
 		}
 
-		return truncateToWidth(` ${parts.join("  ")}`, width, "");
+		let x = 1; // the line starts with one space
+		const rendered: string[] = [];
+		segments.forEach((segment, index) => {
+			if (index > 0) {
+				rendered.push("  ");
+				x += 2;
+			}
+			const segmentWidth = visibleWidth(segment.text);
+			if (segment.run && x + segmentWidth <= width) {
+				this.hits.push({ x, y, width: segmentWidth, run: segment.run });
+			}
+			rendered.push(segment.text);
+			x += segmentWidth;
+		});
+		return truncateToWidth(` ${rendered.join("")}`, width, "");
 	}
 
 	private renderConversation(width: number): string[] {
