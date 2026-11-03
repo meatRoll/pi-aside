@@ -94,12 +94,10 @@ rm ~/.pi/agent/extensions/aside.ts
   "language": "auto",
   "model": "provider/model-id",
   "maxContextChars": 24000,
-  "maxAnswerTokens": 4000,
   "notifyOnComplete": true,
   "tools": true,
   "git": true,
   "network": true,
-  "maxToolCalls": 12,
   "maxToolResultChars": 12000
 }
 ```
@@ -108,7 +106,7 @@ rm ~/.pi/agent/extensions/aside.ts
 - `model`：侧边问答单独用的模型；不填则跟随主对话当前模型。
   也可以随时用 `/aside-model` 选择，选择结果会写回这个文件。
 - `maxContextChars`：快照最多保留多少字符（超出时保留头 65% + 尾 35%，中间标注省略）。
-- `maxAnswerTokens`：单次侧边回答的 token 上限。
+- `maxAnswerTokens`：可选，单次侧边回答的 token 上限；不填则用模型自己的输出上限（和主对话一致）。
 - `notifyOnComplete`：面板关闭时，回答完成是否弹通知。
 - `tools`：启用只读工具（`read`、`grep`、`find`、`ls`、`git`），默认 `true`。
   在面板里按 `Ctrl+G` 可以按 tab 开关。
@@ -117,11 +115,24 @@ rm ~/.pi/agent/extensions/aside.ts
   不提供任意 git 命令执行。
 - `network`：启用 `web_fetch` 抓取具体 http(s) URL，默认 `true`；只有 `tools` 开启时才会注册。
   没有网页搜索。
-- `maxToolCalls`：每个问题最多调用多少次工具（默认 12）。用完后侧边模型用已有证据作答。
 - `maxToolResultChars`：单次工具结果最多保留多少字符（默认 12000）。
   内置工具本身已经会截断大输出，这是第二道 token 预算。
 
-侧边请求固定使用 `reasoning: "low"`，优先速度。
+除了两条刻意的限制（没有 `write`/`edit`/`bash` 工具；独立的消息数组，不碰 session 文件），
+aside 的行为和主对话一致：模型默认跟随主模型（可用 `model` 覆盖），思考强度跟随主对话，
+而且没有工具调用预算 —— 工具在整轮里一直声明着，provider 才能一直把调用解析成结构化字段。
+
+压缩不自己定义策略，而是跟随主对话当前的压缩方案：
+
+- **pi-compactor 接管压缩时**（`~/.pi/agent/compactor/lifecycle.json` 里 enabled）：
+  用它 `~/.pi/agent/compactor/settings.json` 里的 `trigger` / `target`，包括仓库层规则和
+  按模型的覆盖，所以阈值和主对话完全一致。
+- **否则**：用 pi 自己的 `compaction` 配置（`enabled`、`reserveTokens`、`keepRecentTokens`、
+  `modelOverrides`）。
+
+摘要本身走 pi 的摘要器（`generateSummary`），模型和思考强度与主对话相同。遇到 context
+overflow 报错时，aside 会折叠一次并重试这一轮，和主对话一样。面板里仍然显示完整历史，
+只有发给模型的消息数组被压缩。
 
 ## 它是怎么隔离的
 
@@ -152,6 +163,10 @@ rm ~/.pi/agent/extensions/aside.ts
 - 工具调用会增加 token 和延迟。只用快照就够时可以用 `Ctrl+G` 关掉。
 - 侧边请求的 token 用量显示在面板状态行，但不计入主 session 的用量统计。
 - 侧边历史保存在内存里；切换 session（`/new`、`/resume`、`/fork`）或退出 pi 后清空。
+- 没有单独的侧边上下文上限：触发点就是主对话的。装了 pi-compactor 时那个 `trigger`
+  （按模型的百分比或 token 数）说了算；没装时才是 `compaction` 配置里的
+  `contextWindow - reserveTokens`。保留多少近期原文看 `target` / `keepRecentTokens`。
+  pi-compactor 的 **session 级**覆盖只存在内存里，aside 读不到。
 - 只支持 TUI 模式；RPC/print 模式下 `/aside` 会给出提示。
 - `Ctrl+Shift+S` 可能被个别终端占用；用 `/aside` 命令总能打开。
 

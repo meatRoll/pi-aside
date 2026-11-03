@@ -90,12 +90,10 @@ Optional file: `~/.pi/agent/aside.json`
   "language": "auto",
   "model": "provider/model-id",
   "maxContextChars": 24000,
-  "maxAnswerTokens": 4000,
   "notifyOnComplete": true,
   "tools": true,
   "git": true,
   "network": true,
-  "maxToolCalls": 12,
   "maxToolResultChars": 12000
 }
 ```
@@ -109,7 +107,8 @@ Optional file: `~/.pi/agent/aside.json`
   written back to this file.
 - `maxContextChars`: maximum characters kept in the snapshot (when exceeded, keep the
   first 65% and the last 35%, with the omitted middle marked).
-- `maxAnswerTokens`: token limit for a single side answer.
+- `maxAnswerTokens`: optional cap for a single side answer; when omitted the model's own
+  output limit applies (same as the main conversation).
 - `notifyOnComplete`: whether to show a notification when an answer completes while
   the panel is closed.
 - `tools`: enable the read-only tools (`read`, `grep`, `find`, `ls`, `git`). Default `true`.
@@ -119,12 +118,28 @@ Optional file: `~/.pi/agent/aside.json`
   `branches`, `tags`, and `ls`; there is no arbitrary git command execution.
 - `network`: enable `web_fetch` for specific http(s) URLs. Default `true`; it is only
   registered when `tools` is on. There is no web search.
-- `maxToolCalls`: maximum tool calls per question (default 12). When the budget runs
-  out, the side model answers with the evidence gathered so far.
 - `maxToolResultChars`: maximum characters kept from one tool result (default 12000).
   Built-in tools already truncate large outputs; this is a second token budget.
 
-Side requests always use `reasoning: "low"` to favor speed.
+Aside behaves like the main conversation apart from the two deliberate limits: no
+`write`/`edit`/`bash` tools, and a separate message array that never touches the
+session file. The model follows the main session (override with `model`), side
+requests use the main thinking level, and there is no tool-call budget: tools stay
+declared for the whole turn, so the provider keeps parsing tool calls.
+
+Compaction does not invent its own policy; it follows whatever manages the main
+conversation:
+
+- **pi-compactor owns compaction** (`~/.pi/agent/compactor/lifecycle.json` enabled): the
+  `trigger` / `target` from `~/.pi/agent/compactor/settings.json` are used, including the
+  repository layer and per-model rules, so the numbers match the main chat.
+- **Otherwise**: pi's own `compaction` settings (`enabled`, `reserveTokens`,
+  `keepRecentTokens`, `modelOverrides`).
+
+The summary itself comes from pi's summarizer (`generateSummary`), using the same model
+and thinking level as the main conversation. On a context-overflow error Aside folds once
+and retries that round, like the main chat. The panel keeps showing the full history;
+only the message array sent to the model is compacted.
 
 ## How isolation works
 
@@ -165,6 +180,11 @@ for subsequent model calls.
   in the main session's usage statistics.
 - Side history lives in memory. Switching sessions (`/new`, `/resume`, `/fork`) or
   exiting pi clears it.
+- There is no separate side-context cap. The trigger is the main conversation's, so with
+  pi-compactor it is that config's `trigger` (a percentage or token count per model), and
+  without it, `contextWindow - reserveTokens` from the `compaction` settings. Retained
+  text follows `target` / `keepRecentTokens`. pi-compactor's session-scoped overrides are
+  in memory only and are not visible to Aside.
 - TUI mode only. In RPC/print mode, `/aside` shows a hint instead.
 - `Ctrl+Shift+S` may be captured by some terminals; `/aside` always opens the panel.
 

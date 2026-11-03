@@ -15,6 +15,11 @@
  *   the preceding user request) and sends it as part of the system prompt. The
  *   snapshot is a copy; refresh it with Ctrl+R when the main chat changes.
  * - The panel is an overlay: the transcript does not scroll or reflow.
+ * - Everything else follows the main conversation: the side model defaults to the
+ *   main model, the thinking level is the main session's, and the replay is
+ *   compacted with whatever policy the main conversation uses (pi-compactor if it
+ *   owns compaction, otherwise pi's own `compaction` settings). Tools are never
+ *   withdrawn mid-turn, so the provider keeps parsing tool calls.
  *
  * Lifecycle
  * - Esc only hides the panel; the request keeps streaming in the background
@@ -31,8 +36,9 @@
  */
 
 import { execFile, execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { lookup } from "node:dns/promises";
-import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { isIP } from "node:net";
 import { join, resolve } from "node:path";
 
@@ -44,16 +50,19 @@ import type {
 	ToolCall,
 	UserMessage,
 } from "@earendil-works/pi-ai";
+import { isContextOverflow } from "@earendil-works/pi-ai";
 import {
 	createFindToolDefinition,
 	createGrepToolDefinition,
 	createLsToolDefinition,
 	createReadToolDefinition,
+	DEFAULT_COMPACTION_SETTINGS,
 	type ExtensionAPI,
 	type ExtensionCommandContext,
 	type ExtensionContext,
 	type ExtensionToolContext,
 	type ExtensionUIContext,
+	generateSummary,
 	getAgentDir,
 	getMarkdownTheme,
 	getSelectListTheme,
@@ -90,7 +99,7 @@ interface AsideConfig {
 	model?: string;
 	/** Maximum number of characters kept in a snapshot */
 	maxContextChars?: number;
-	/** Maximum number of tokens per side answer */
+	/** Maximum number of tokens per side answer. Defaults to the model's own limit. */
 	maxAnswerTokens?: number;
 	/** Whether to notify when an answer completes while the panel is closed */
 	notifyOnComplete?: boolean;
@@ -100,20 +109,15 @@ interface AsideConfig {
 	git?: boolean;
 	/** Enable web_fetch (http/https only). Default: true; requires tools. */
 	network?: boolean;
-	/** Maximum tool calls per question. Default: 12 */
-	maxToolCalls?: number;
 	/** Maximum characters kept from a single tool result. Default: 12000 */
 	maxToolResultChars?: number;
 }
 
 const DEFAULTS = {
 	maxContextChars: 24000,
-	maxAnswerTokens: 4000,
 	notifyOnComplete: true,
 	maxTabs: 9,
-	maxToolCalls: 12,
 	maxToolResultChars: 12000,
-	maxToolRounds: 8,
 };
 
 function asideConfigPath(): string {
@@ -159,6 +163,7 @@ interface UiMessages {
 	requestFailed: string;
 	requestCancelled: string;
 	emptyAnswer: string;
+	leakedToolCall: string;
 
 	noteNoActiveRequest: string;
 	noteCancelled: string;
@@ -184,6 +189,7 @@ interface UiMessages {
 	statusWaiting: string;
 	statusThinking: (chars: string) => string;
 	statusGenerating: string;
+	statusCompacting: string;
 	statusIdle: string;
 	statusSnapshot: (chars: string, truncated: boolean) => string;
 	statusSnapshotOff: string;
@@ -244,6 +250,7 @@ const EN_MESSAGES: UiMessages = {
 	requestFailed: "Request failed",
 	requestCancelled: "Cancelled",
 	emptyAnswer: "No answer received",
+	leakedToolCall: "The model wrote a tool call as plain text and the provider returned it as content, so this turn produced no answer.",
 
 	noteNoActiveRequest: "This tab has no answer in progress",
 	noteCancelled: "Generation cancelled",
@@ -269,6 +276,7 @@ const EN_MESSAGES: UiMessages = {
 	statusWaiting: "● waiting for the first token…",
 	statusThinking: (chars) => `● thinking… ${chars} chars`,
 	statusGenerating: "● generating…",
+	statusCompacting: "● compacting context…",
 	statusIdle: "○ idle",
 	statusSnapshot: (chars, truncated) => `snapshot ${chars} chars${truncated ? " (truncated)" : ""}`,
 	statusSnapshotOff: "snapshot off",
@@ -330,6 +338,7 @@ const ZH_MESSAGES: UiMessages = {
 	requestFailed: "请求失败",
 	requestCancelled: "已取消",
 	emptyAnswer: "没有收到回答",
+	leakedToolCall: "模型把工具调用写成了纯文本，provider 原样返回，这一轮没有产生回答。",
 
 	noteNoActiveRequest: "当前 tab 没有正在生成的回答",
 	noteCancelled: "已取消生成",
@@ -355,6 +364,7 @@ const ZH_MESSAGES: UiMessages = {
 	statusWaiting: "● 等待首个 token…",
 	statusThinking: (chars) => `● 思考中… ${chars} 字`,
 	statusGenerating: "● 生成中…",
+	statusCompacting: "● 压缩上下文…",
 	statusIdle: "○ 就绪",
 	statusSnapshot: (chars, truncated) => `快照 ${chars} 字符${truncated ? "（截断）" : ""}`,
 	statusSnapshotOff: "快照关闭",
@@ -588,6 +598,48 @@ function contentText(content: unknown): string {
 	return parts.join("\n");
 }
 
+/**
+ * Native tool-call markup that a provider returned as plain text because it did not
+ * parse it into `tool_calls`. Only DeepSeek's DSML is recognised; a message has to
+ * look like an actual call, so quoting one in an explanation is left alone.
+ */
+const LEAKED_TOOL_MARKUP = /(?:<|＜)\s*[|｜]{1,2}\s*DSML/gi;
+
+function strippedToolMarkup(text: string): string | undefined {
+	for (const match of text.matchAll(LEAKED_TOOL_MARKUP)) {
+		const index = match.index ?? 0;
+		// A real leak owns its line; an inline mention is usually the model quoting the format.
+		if (text.slice(text.lastIndexOf("\n", index - 1) + 1, index).trim() !== "") continue;
+		const tail = text.slice(index);
+		if (!/\b(?:invoke|parameter)\b/i.test(tail)) continue;
+		return text.slice(0, index).trimEnd();
+	}
+	return undefined;
+}
+
+/** Drop leaked tool markup from a finished reply; a reply that was only markup becomes a visible error. */
+function discardLeakedToolMarkup(turn: AsideTurn, final: AssistantMessage): void {
+	if (strippedToolMarkup(contentText(final.content)) === undefined) return;
+	for (const block of final.content) {
+		if (block.type !== "text") continue;
+		const text = strippedToolMarkup(block.text);
+		if (text !== undefined) block.text = text;
+	}
+
+	const parts = turn.parts;
+	const last = parts[parts.length - 1];
+	if (last?.kind === "text") {
+		const text = strippedToolMarkup(last.text) ?? last.text;
+		if (text.trim()) last.text = text;
+		else parts.pop();
+	}
+	turn.answer = parts
+		.filter((part) => part.kind === "text")
+		.map((part) => part.text)
+		.join("\n\n");
+	if (!turn.answer.trim()) turn.error = t().leakedToolCall;
+}
+
 /** Capture from the end of the current branch: last assistant reply + preceding user request. */
 function captureSnapshot(ctx: ExtensionContext, maxChars: number): Snapshot | undefined {
 	let assistantText: string | undefined;
@@ -653,11 +705,8 @@ interface AsideTurn {
 	question: string;
 	answer: string;
 	error?: string;
-	message?: AssistantMessage;
 	/** Chronological text/tool trace for display */
 	parts: AsidePart[];
-	/** Full model exchange for this turn: user, assistant, tool results */
-	transcript: Message[];
 	thinkingChars?: number;
 	startedAt?: number;
 }
@@ -666,7 +715,13 @@ interface AsideTab {
 	id: string;
 	title?: string;
 	turns: AsideTurn[];
-	status: "idle" | "thinking" | "streaming";
+	/** Flat replay sent to the model; compaction rewrites this array only */
+	messages: Message[];
+	/** Latest compaction summary, fed back as previous summary */
+	summary?: string;
+	/** The user message that carries `summary` at the head of `messages` */
+	summaryMessage?: UserMessage;
+	status: "idle" | "thinking" | "streaming" | "compacting";
 	abort?: AbortController;
 	/** Unsent input, saved per tab */
 	draft: string;
@@ -686,6 +741,11 @@ interface SessionRuntime {
 	sessionId: string;
 	ui: ExtensionUIContext;
 	modelRegistry: ExtensionContext["modelRegistry"];
+	/** Live main-session context, for thinking level and settings reads */
+	ctx: ExtensionContext;
+	/** Cached pi-compactor repository key; null when unavailable */
+	repositoryId?: string | null;
+	getSettings: ExtensionAPI["getSettings"];
 	config: AsideConfig;
 	cwd: string;
 	captureSnapshot: () => Snapshot | undefined;
@@ -731,6 +791,7 @@ function createTab(runtime: SessionRuntime, takeSnapshot = true): AsideTab {
 	return {
 		id: `tab-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
 		turns: [],
+		messages: [],
 		status: "idle",
 		draft: "",
 		snapshot,
@@ -745,7 +806,11 @@ function createTab(runtime: SessionRuntime, takeSnapshot = true): AsideTab {
 	};
 }
 
-function getRuntime(ctx: ExtensionContext, config: AsideConfig): SessionRuntime {
+function getRuntime(
+	ctx: ExtensionContext,
+	config: AsideConfig,
+	getSettings: ExtensionAPI["getSettings"],
+): SessionRuntime {
 	const key = sessionKey(ctx);
 	let runtime = runtimes.get(key);
 	if (runtime) return runtime;
@@ -754,6 +819,8 @@ function getRuntime(ctx: ExtensionContext, config: AsideConfig): SessionRuntime 
 		sessionId: key,
 		ui: ctx.ui,
 		modelRegistry: ctx.modelRegistry,
+		ctx,
+		getSettings,
 		config,
 		cwd: ctx.cwd,
 		captureSnapshot: () => captureSnapshot(ctx, config.maxContextChars ?? DEFAULTS.maxContextChars),
@@ -825,23 +892,306 @@ function buildSystemPrompt(tab: AsideTab, runtime: SessionRuntime, toolsEnabled:
 	return sections.join("\n\n");
 }
 
-function buildMessages(tab: AsideTab): Message[] {
-	const messages: Message[] = [];
-	for (const turn of tab.turns) {
-		if (turn.transcript.some((message) => message.role === "assistant")) {
-			messages.push(...turn.transcript);
+/** Same preamble pi puts in front of a compaction summary. */
+const COMPACTION_SUMMARY_PREFIX = `The conversation history before this point was compacted into the following summary:
+
+<summary>
+`;
+
+const COMPACTION_SUMMARY_SUFFIX = `
+</summary>`;
+
+function compactionSummaryMessage(summary: string, timestamp = Date.now()): UserMessage {
+	return {
+		role: "user",
+		content: [{ type: "text", text: COMPACTION_SUMMARY_PREFIX + summary + COMPACTION_SUMMARY_SUFFIX }],
+		timestamp,
+	};
+}
+
+/** The main session's thinking level, so side requests reason as hard as the main chat. */
+type MainThinkingLevel = Exclude<NonNullable<ExtensionContext["thinkingLevel"]>, "off">;
+
+function thinkingLevel(runtime: SessionRuntime): MainThinkingLevel | undefined {
+	let level: ExtensionContext["thinkingLevel"];
+	try {
+		level = runtime.ctx.thinkingLevel;
+	} catch {
+		return undefined;
+	}
+	return level === undefined || level === "off" ? undefined : level;
+}
+
+/** Re-resolve the configured model against the live session, so /model changes carry over. */
+function liveModel(runtime: SessionRuntime): NonNullable<SessionRuntime["model"]> | undefined {
+	try {
+		return resolveAsideModel(runtime.ctx, runtime.config) ?? runtime.model;
+	} catch {
+		return runtime.model;
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Context compaction (same settings and summarizer as the main conversation)
+// ---------------------------------------------------------------------------
+
+/** CJK codepoints cost roughly one token each; other characters roughly a quarter. */
+function textTokens(text: string): number {
+	let cjk = 0;
+	let other = 0;
+	for (const char of text) {
+		if ((char.codePointAt(0) ?? 0) >= 0x2e80) cjk += 1;
+		else other += 1;
+	}
+	return Math.ceil(cjk + other / 4);
+}
+
+function messageTokens(message: Message): number {
+	if (message.role === "assistant") {
+		let tokens = 0;
+		for (const block of message.content) {
+			if (block.type === "text") tokens += textTokens(block.text);
+			else if (block.type === "thinking") tokens += textTokens(block.thinking);
+			else if (block.type === "toolCall") tokens += textTokens(block.name) + textTokens(JSON.stringify(block.arguments));
+		}
+		return tokens;
+	}
+	if (message.role === "toolResult") {
+		let tokens = 0;
+		for (const block of message.content) {
+			// Attached images cost a flat estimate; the text is what actually grows.
+			if (block.type === "text") tokens += textTokens(block.text);
+			else tokens += 1_200;
+		}
+		return tokens;
+	}
+	return textTokens(contentText(message.content));
+}
+
+function replayTokens(messages: Message[], systemPrompt: string, toolsJson: string): number {
+	let tokens = textTokens(systemPrompt) + textTokens(toolsJson);
+	for (const message of messages) tokens += messageTokens(message);
+	return tokens;
+}
+
+/** Keep about `keepRecentTokens` of recent messages, cutting at an assistant message so calls keep their results. */
+function findCompactCut(messages: Message[], keepRecentTokens: number): number {
+	let accumulated = 0;
+	let cut = -1;
+	for (let index = messages.length - 1; index >= 0; index -= 1) {
+		accumulated += messageTokens(messages[index]!);
+		if (accumulated >= keepRecentTokens) {
+			cut = index;
+			break;
+		}
+	}
+	if (cut < 0) return -1;
+	// Snap back to the assistant message that owns these tool results, so no call loses its result.
+	while (cut > 0 && messages[cut]?.role !== "assistant") cut -= 1;
+	return cut;
+}
+
+interface MainCompactionSettings {
+	enabled?: boolean;
+	reserveTokens?: number;
+	keepRecentTokens?: number;
+	modelOverrides?: Record<string, { reserveTokens?: number; keepRecentTokens?: number }>;
+}
+
+/** pi's own `compaction` settings, used when nothing else manages the main conversation's compaction. */
+function nativeCompactionSettings(runtime: SessionRuntime, model: NonNullable<SessionRuntime["model"]>) {
+	const configured = runtime.getSettings().compaction as MainCompactionSettings | undefined;
+	const override = configured?.modelOverrides?.[`${model.provider}/${model.id}`];
+	return {
+		enabled: configured?.enabled ?? DEFAULT_COMPACTION_SETTINGS.enabled,
+		reserveTokens: override?.reserveTokens ?? configured?.reserveTokens ?? DEFAULT_COMPACTION_SETTINGS.reserveTokens,
+		keepRecentTokens:
+			override?.keepRecentTokens ?? configured?.keepRecentTokens ?? DEFAULT_COMPACTION_SETTINGS.keepRecentTokens,
+	};
+}
+
+// ---------------------------------------------------------------------------
+// pi-compactor policy (the main conversation's compaction when the plugin owns it)
+// ---------------------------------------------------------------------------
+
+interface CompactorAmount {
+	unit?: string;
+	value?: number;
+}
+
+interface CompactorRule {
+	trigger?: CompactorAmount;
+	target?: CompactorAmount;
+}
+
+interface CompactorLayer {
+	all?: CompactorRule;
+	models?: Record<string, CompactorRule>;
+}
+
+interface CompactorConfig {
+	version?: number;
+	automatic?: boolean;
+	global?: CompactorLayer;
+	repositories?: Record<string, CompactorLayer>;
+}
+
+interface CompactionPolicy {
+	/** Fold once the replay grows past this many tokens. */
+	triggerTokens: number;
+	/** Target size after folding, including the system prompt. */
+	targetTokens: number;
+	/** Whether the proactive trigger is on; overflow recovery ignores this. */
+	automatic: boolean;
+}
+
+/** pi-compactor refuses to trigger below this, so match it. */
+const COMPACTOR_MIN_TRIGGER = 20_000;
+
+function amountTokens(amount: CompactorAmount | undefined, contextWindow: number): number | undefined {
+	if (typeof amount?.value !== "number" || !Number.isFinite(amount.value) || amount.value <= 0) return undefined;
+	return amount.unit === "percent" ? Math.ceil((contextWindow * amount.value) / 100) : Math.round(amount.value);
+}
+
+/** Mirrors pi-compactor's `resolve()`: global layer, then repository layer, `all` then per-model rules. */
+function resolveCompactorPolicy(
+	config: CompactorConfig | undefined,
+	repository: string | undefined,
+	model: NonNullable<SessionRuntime["model"]>,
+): CompactionPolicy | undefined {
+	if (config?.version !== 1) return undefined;
+	let trigger: number | undefined;
+	let target: number | undefined;
+	for (const layer of [config.global, repository ? config.repositories?.[repository] : undefined]) {
+		if (!layer) continue;
+		for (const key of [undefined, `${model.provider}/${model.id}`]) {
+			const rule = key ? layer.models?.[key] : layer.all;
+			trigger = amountTokens(rule?.trigger, model.contextWindow) ?? trigger;
+			target = amountTokens(rule?.target, model.contextWindow) ?? target;
+		}
+	}
+	const triggerTokens = Math.max(COMPACTOR_MIN_TRIGGER, trigger ?? Math.ceil(model.contextWindow * 0.8));
+	const targetTokens = target ?? COMPACTOR_MIN_TRIGGER;
+	if (targetTokens >= triggerTokens) return undefined;
+	return { triggerTokens, targetTokens, automatic: config.automatic !== false };
+}
+
+function readJsonFile<T>(path: string): T | undefined {
+	try {
+		return JSON.parse(readFileSync(path, "utf8")) as T;
+	} catch {
+		return undefined;
+	}
+}
+
+/** The key pi-compactor uses for repository rules: sha256 of the realpath of the git common dir. */
+function repositoryIdentity(cwd: string): string | undefined {
+	const candidates: string[] = [];
+	try {
+		const common = execFileSync("git", ["rev-parse", "--git-common-dir"], { cwd, encoding: "utf8", timeout: 5_000 });
+		candidates.push(resolve(cwd, common.trim()));
+	} catch {
+		// Not a repository: pi-compactor hashes the working directory instead.
+	}
+	candidates.push(cwd);
+	for (const candidate of candidates) {
+		try {
+			return createHash("sha256").update(realpathSync(candidate)).digest("hex");
+		} catch {
 			continue;
 		}
-		// Fallback for turns created before tool support existed.
-		if (!turn.message || !turn.answer.trim()) continue;
-		const user: UserMessage = {
-			role: "user",
-			content: [{ type: "text", text: turn.question }],
-			timestamp: turn.message.timestamp ?? Date.now(),
-		};
-		messages.push(user, turn.message);
 	}
-	return messages;
+	return undefined;
+}
+
+/** pi-compactor's policy when it owns compaction, otherwise undefined. */
+function compactorPolicy(runtime: SessionRuntime, model: NonNullable<SessionRuntime["model"]>): CompactionPolicy | undefined {
+	const dir = join(getAgentDir(), "compactor");
+	const lifecycle = readJsonFile<{ enabled?: boolean }>(join(dir, "lifecycle.json"));
+	if (!lifecycle || lifecycle.enabled === false) return undefined;
+	const config = readJsonFile<CompactorConfig>(join(dir, "settings.json"));
+	if (!config) return undefined;
+	if (runtime.repositoryId === undefined) runtime.repositoryId = repositoryIdentity(runtime.cwd) ?? null;
+	return resolveCompactorPolicy(config, runtime.repositoryId ?? undefined, model);
+}
+
+// ---------------------------------------------------------------------------
+// Compaction
+// ---------------------------------------------------------------------------
+
+/**
+ * Fold the oldest part of the replay into a summary. The trigger and the retained size
+ * come from whatever manages the main conversation (pi-compactor if it is installed,
+ * otherwise pi's own `compaction` settings); the summary itself is pi's summarizer.
+ * Display parts are never touched.
+ */
+async function maybeCompact(
+	runtime: SessionRuntime,
+	tab: AsideTab,
+	model: NonNullable<SessionRuntime["model"]>,
+	systemPrompt: string,
+	toolsJson: string,
+	signal: AbortSignal,
+	options: { force?: boolean } = {},
+): Promise<boolean> {
+	const systemTokens = textTokens(systemPrompt);
+	const policy = compactorPolicy(runtime, model);
+	const native = nativeCompactionSettings(runtime, model);
+	let enabled: boolean;
+	let triggerTokens: number;
+	let keepTokens: number;
+	if (policy) {
+		enabled = options.force === true || policy.automatic;
+		triggerTokens = policy.triggerTokens;
+		// pi-compactor keeps room for the system prompt and the summary inside the target.
+		keepTokens = Math.max(0, policy.targetTokens - systemTokens - 4_096);
+	} else {
+		enabled = options.force === true || native.enabled;
+		triggerTokens = model.contextWindow - native.reserveTokens;
+		keepTokens = native.keepRecentTokens;
+	}
+	if (!enabled) return false;
+	if (!options.force && replayTokens(tab.messages, systemPrompt, toolsJson) <= triggerTokens) return false;
+
+	const cut = findCompactCut(tab.messages, keepTokens);
+	if (cut <= 0) return false;
+	// The previous summary is passed along separately instead of being summarized again.
+	const head = tab.messages.slice(0, cut).filter((message) => message !== tab.summaryMessage);
+	if (head.length === 0) return false;
+
+	tab.status = "compacting";
+	notifyTab(runtime, tab, false);
+	try {
+		const auth = await runtime.modelRegistry.getApiKeyAndHeaders(model);
+		if (!auth.ok || signal.aborted) return false;
+		const headers = auth.headers
+			? (Object.fromEntries(Object.entries(auth.headers).filter(([, value]) => value !== null)) as Record<string, string>)
+			: undefined;
+		const summary = await generateSummary(
+			head,
+			model,
+			undefined,
+			auth.apiKey,
+			headers,
+			signal,
+			undefined,
+			tab.summary,
+			thinkingLevel(runtime),
+			(target, context, options) => runtime.modelRegistry.stream(target, context, options),
+		);
+		if (signal.aborted) return false;
+		tab.summary = summary;
+		tab.summaryMessage = compactionSummaryMessage(summary);
+		tab.messages = [tab.summaryMessage, ...tab.messages.slice(cut)];
+		return true;
+	} catch (error) {
+		if (signal.aborted) return false;
+		const detail = error instanceof Error ? error.message : String(error);
+		runtime.ui.notify(`${t().statusCompacting} ${detail}`, "warning");
+		return false;
+	} finally {
+		tab.status = "thinking";
+	}
 }
 
 function firstLine(text: string, maxChars = 100): string {
@@ -1083,7 +1433,7 @@ async function fetchDocument(rawUrl: string, outerSignal?: AbortSignal): Promise
 				redirect: "manual",
 				signal: controller.signal,
 				headers: {
-					"user-agent": "pi-aside/1.3.0 (+https://github.com/meatRoll/pi-aside)",
+					"user-agent": "pi-aside/1.4.0 (+https://github.com/meatRoll/pi-aside)",
 					accept: "text/html,application/xhtml+xml,application/json,text/plain;q=0.9,*/*;q=0.5",
 				},
 			});
@@ -1459,12 +1809,13 @@ async function ask(runtime: SessionRuntime, tab: AsideTab, raw: string): Promise
 	if (!question) return;
 	if (tab.status !== "idle") return;
 
-	const model = runtime.model;
+	const model = liveModel(runtime);
 	if (!model) {
-		tab.turns.push({ question, answer: "", error: t().noModel, parts: [], transcript: [] });
+		tab.turns.push({ question, answer: "", error: t().noModel, parts: [] });
 		notifyTab(runtime, tab, true);
 		return;
 	}
+	runtime.model = model;
 
 	if (!tab.title) tab.title = question.replace(/\s+/g, " ").slice(0, uiLanguage === "zh" ? 18 : 28);
 
@@ -1472,17 +1823,18 @@ async function ask(runtime: SessionRuntime, tab: AsideTab, raw: string): Promise
 		question,
 		answer: "",
 		parts: [],
-		transcript: [],
 		thinkingChars: 0,
 		startedAt: Date.now(),
 	};
-	const priorMessages = buildMessages(tab);
+	// Messages authored by this turn; dropped again when the turn produced no assistant reply.
+	const turnMessages: Message[] = [];
 	const userMessage: UserMessage = {
 		role: "user",
 		content: [{ type: "text", text: question }],
 		timestamp: Date.now(),
 	};
-	turn.transcript.push(userMessage);
+	tab.messages.push(userMessage);
+	turnMessages.push(userMessage);
 
 	tab.turns.push(turn);
 	tab.status = "thinking";
@@ -1495,31 +1847,33 @@ async function ask(runtime: SessionRuntime, tab: AsideTab, raw: string): Promise
 
 	const toolDefinitions = tab.useTools ? buildToolDefinitions(runtime) : [];
 	const toolByName = new Map(toolDefinitions.map((definition) => [definition.name, definition]));
-	let toolDeclarations = toolDefinitions.map(({ name, description, parameters }) => ({
+	const toolDeclarations = toolDefinitions.map(({ name, description, parameters }) => ({
 		name,
 		description,
 		parameters,
 	}));
-	let toolBudget = runtime.config.maxToolCalls ?? DEFAULTS.maxToolCalls;
-	let toolRounds = 0;
-	const maxToolRounds = DEFAULTS.maxToolRounds;
+	const useTools = toolDeclarations.length > 0;
+	const systemPrompt = buildSystemPrompt(tab, runtime, useTools);
+	const toolsJson = useTools ? JSON.stringify(toolDeclarations) : "";
 	const toolContext = { cwd: runtime.cwd, model } as unknown as ExtensionToolContext;
-	const messages: Message[] = [...priorMessages, userMessage];
+	let overflowRetried = false;
 
 	try {
 		while (true) {
-			const useTools = tab.useTools && toolDeclarations.length > 0;
+			await maybeCompact(runtime, tab, model, systemPrompt, toolsJson, controller.signal);
+			if (controller.signal.aborted) break;
 			const stream = runtime.modelRegistry.streamSimple(
 				model,
 				{
-					systemPrompt: buildSystemPrompt(tab, runtime, useTools),
-					messages,
+					systemPrompt,
+					messages: tab.messages,
 					tools: useTools ? toolDeclarations : undefined,
 				},
 				{
 					signal: controller.signal,
-					maxTokens: runtime.config.maxAnswerTokens ?? DEFAULTS.maxAnswerTokens,
-					reasoning: "low",
+					maxTokens: runtime.config.maxAnswerTokens,
+					reasoning: thinkingLevel(runtime),
+					thinkingBudgets: runtime.getSettings().thinkingBudgets,
 				},
 			);
 			tab.status = "streaming";
@@ -1561,15 +1915,20 @@ async function ask(runtime: SessionRuntime, tab: AsideTab, raw: string): Promise
 				}
 			}
 
-			turn.message = final;
-			messages.push(final);
-			turn.transcript.push(final);
+			if (final.stopReason === "error" && !overflowRetried && isContextOverflow(final, model.contextWindow)) {
+				// The failed request never entered the replay: fold the context and ask again.
+				overflowRetried = true;
+				if (await maybeCompact(runtime, tab, model, systemPrompt, toolsJson, controller.signal, { force: true })) {
+					turn.error = undefined;
+					continue;
+				}
+			}
 
 			const calls = final.content.filter((block): block is ToolCall => block.type === "toolCall");
+			if (calls.length === 0) discardLeakedToolMarkup(turn, final);
+			tab.messages.push(final);
+			turnMessages.push(final);
 			if (calls.length === 0) break;
-
-			toolRounds += 1;
-			const overRounds = toolRounds > maxToolRounds;
 
 			for (let index = 0; index < calls.length; index++) {
 				const call = calls[index]!;
@@ -1588,21 +1947,7 @@ async function ask(runtime: SessionRuntime, tab: AsideTab, raw: string): Promise
 					result = { content: [{ type: "text", text: call.argumentsError }], isError: true };
 				} else if (!definition) {
 					result = { content: [{ type: "text", text: `Unknown tool: ${call.name}` }], isError: true };
-				} else if (overRounds || toolBudget <= 0) {
-					result = {
-						content: [
-							{
-								type: "text",
-								text:
-									toolBudget <= 0
-										? `Tool call budget exhausted (${runtime.config.maxToolCalls ?? DEFAULTS.maxToolCalls} calls)`
-										: `Tool round limit exhausted (${maxToolRounds} rounds)`,
-							},
-						],
-						isError: true,
-					};
 				} else {
-					toolBudget -= 1;
 					try {
 						result = await definition.execute(call, controller.signal, toolContext);
 					} catch (error) {
@@ -1617,8 +1962,8 @@ async function ask(runtime: SessionRuntime, tab: AsideTab, raw: string): Promise
 				part.detail = summarizeToolResult(result.content, result.isError === true);
 
 				const message = toolResultMessage(call, result, runtime);
-				messages.push(message);
-				turn.transcript.push(message);
+				tab.messages.push(message);
+				turnMessages.push(message);
 				runtime.requestRenderSoon?.();
 
 				if (controller.signal.aborted) {
@@ -1630,24 +1975,23 @@ async function ask(runtime: SessionRuntime, tab: AsideTab, raw: string): Promise
 							{ content: [{ type: "text", text: t().requestCancelled }], isError: true },
 							runtime,
 						);
-						messages.push(skippedMessage);
-						turn.transcript.push(skippedMessage);
+						tab.messages.push(skippedMessage);
+						turnMessages.push(skippedMessage);
 					}
 					break;
 				}
 			}
 
 			if (controller.signal.aborted) break;
-			if (overRounds || toolBudget <= 0) {
-				// Answer with the evidence gathered so far; do not keep calling tools.
-				toolDeclarations = [];
-			}
 		}
 	} catch (error) {
 		if (controller.signal.aborted) turn.error = t().requestCancelled;
 		else turn.error = error instanceof Error ? error.message : String(error);
 	} finally {
 		if (tab.abort === controller) tab.abort = undefined;
+		if (!turnMessages.some((message) => message.role === "assistant")) {
+			tab.messages = tab.messages.filter((message) => !turnMessages.includes(message));
+		}
 		tab.status = "idle";
 		if (!turn.answer && !turn.error) turn.error = t().emptyAnswer;
 		notifyTab(runtime, tab, true);
@@ -2120,6 +2464,7 @@ class AsidePanel implements Component, Focusable {
 		const parts: string[] = [];
 
 		if (tab.status === "thinking") parts.push(theme.fg("accent", t().statusWaiting));
+		else if (tab.status === "compacting") parts.push(theme.fg("accent", t().statusCompacting));
 		else if (tab.status === "streaming") {
 			const last = tab.turns[tab.turns.length - 1];
 			const thinking = last?.answer ? 0 : (last?.thinkingChars ?? 0);
@@ -2215,7 +2560,7 @@ class AsidePanel implements Component, Focusable {
 				for (const line of part.markdown.render(contentWidth)) lines.push(`  ${line}`);
 			}
 
-			if (parts.length === 0 && (tab.status === "thinking" || tab.status === "streaming")) {
+			if (parts.length === 0 && tab.status !== "idle") {
 				const thinking = turn.thinkingChars ?? 0;
 				lines.push(theme.fg("dim", t().inlineThinking(thinking > 0 ? formatTokens(thinking) : undefined)));
 			}
@@ -2252,7 +2597,7 @@ export default function asideExtension(pi: ExtensionAPI) {
 			return;
 		}
 
-		const runtime = getRuntime(ctx, config);
+		const runtime = getRuntime(ctx, config, () => pi.getSettings());
 		if (runtime.panelOpen) {
 			ctx.ui.notify(t().alreadyOpen, "info");
 			return;
