@@ -62,7 +62,7 @@ rm ~/.pi/agent/extensions/aside.ts
 
 You can use it while the main agent is streaming.
 
-To quote the conversation: select text in the main transcript (fullscreen mode, the default; Pi owns the selection), then press `Ctrl+Shift+S` or run `/aside`. The excerpt opens in a tab of its own and is sent with the first question in that tab, then dropped — it is never inherited by new tabs and reopening the panel does not bring it back. The selection is consumed on open, so reopening without selecting anything keeps the current tab instead of quoting the old text again. `Alt+S` excludes the quote from the next question if you do not want it.
+To quote the conversation: select text in the main transcript (fullscreen mode, the default; Pi owns the selection), then press `Ctrl+Shift+S` or run `/aside`. The excerpt opens in a tab of its own and is sent with the first question in that tab, then dropped — it is never inherited by new tabs, and once sent it does not come back when you reopen the panel. The selection is consumed on open, so reopening without selecting anything keeps the current tab instead of quoting the old text again. `Alt+S` excludes the quote from the next question if you do not want it.
 
 | Key | Action |
 |---|---|
