@@ -15,8 +15,9 @@
  *   the preceding user request) and sends it as part of the system prompt. The
  *   snapshot is a copy; refresh it with Ctrl+R when the main chat changes.
  * - Text selected in the main transcript is captured when the panel opens and is
- *   sent as a quoted excerpt. The quote gets a tab of its own (a pristine tab is
- *   reused), and the selection is cleared on open, so reopening without a new
+ *   sent as a quoted excerpt with the first question in its tab, then dropped. The
+ *   quote gets a tab of its own (a pristine tab is reused) and is never inherited
+ *   by new tabs; the selection is cleared on open, so reopening without a new
  *   selection does not quote the old text again. This works in fullscreen mode,
  *   where Pi owns the selection; regular mode leaves selection to the terminal.
  * - The panel is an overlay: the transcript does not scroll or reflow.
@@ -920,6 +921,17 @@ function tabForSelection(runtime: SessionRuntime, selection: SelectionQuote): As
 	runtime.tabs.push(tab);
 	runtime.activeId = tab.id;
 	return tab;
+}
+
+/**
+ * Drop a quote that has just been sent. A selection is worth exactly one request: keeping it
+ * would re-send it with every later question in the tab. A quote the user toggled off with
+ * Alt+S is left alone, because it has not been used yet.
+ */
+function consumeTabSelection(tab: AsideTab): void {
+	if (!tab.useSelection) return;
+	tab.selection = undefined;
+	tab.useSelection = false;
 }
 
 function getRuntime(
@@ -1977,6 +1989,8 @@ async function ask(runtime: SessionRuntime, tab: AsideTab, raw: string): Promise
 	}));
 	const useTools = toolDeclarations.length > 0;
 	const systemPrompt = buildSystemPrompt(tab, runtime, useTools);
+	// A quoted selection is one-shot: this request has it, later requests do not.
+	consumeTabSelection(tab);
 	const toolsJson = useTools ? JSON.stringify(toolDeclarations) : "";
 	const toolContext = { cwd: runtime.cwd, model } as unknown as ExtensionToolContext;
 	let overflowRetried = false;
@@ -2397,7 +2411,8 @@ class AsidePanel implements Component, Focusable {
 		}
 
 		this.saveDraft();
-		const tab = createTab(runtime, true, current.selection, current.useSelection);
+		// New tabs start clean: a quote belongs to the request that used it, never to a sibling tab.
+		const tab = createTab(runtime, true);
 		runtime.tabs.push(tab);
 		runtime.activeId = tab.id;
 		this.loadDraft();
@@ -2414,7 +2429,7 @@ class AsidePanel implements Component, Focusable {
 		runtime.tabs.splice(index, 1);
 
 		if (runtime.tabs.length === 0) {
-			const fresh = createTab(runtime, true, tab.selection, tab.useSelection);
+			const fresh = createTab(runtime, true);
 			runtime.tabs.push(fresh);
 			runtime.activeId = fresh.id;
 		} else {
