@@ -19,6 +19,7 @@ A good fit: the AI is writing a long document or running a task, and you want to
 - **Selection quote**: select text in the main transcript, then open Aside; the excerpt gets a tab of its own (an untouched tab is reused) and is sent with exactly one question, then dropped. The selection is consumed on open too, so reopening without selecting again does not repeat it; `Ctrl+\` then `q` (or a click on the `selection` chip) can exclude the quote from the next question.
 - **Read-only tools**: when the snapshot is not enough, the side model can inspect the repo or system files with `read` / `grep` / `find` / `ls`, read git history and commit data with `git`, and fetch a URL with `web_fetch`. There is no `bash`, `edit`, or `write` tool, so it cannot modify files.
 - **Optional write-back**: only the write-back action (command mode `y`, or the chip under the last answer) writes a Q&A turn into the main conversation. That is the only step that enters the main context.
+- **Full-screen reading view**: `Ctrl+O` (or command mode `f`) opens the active tab as plain text across the whole terminal — no frame, title, status line, or hints — so terminal selection copies only the answer. `PgUp`/`PgDn`, the wheel, and `Ctrl+Home`/`Ctrl+End` scroll; `Esc` or `Ctrl+O` returns to the panel.
 - **Independent model**: use a cheap/fast model for explanations without spending the main model's budget.
 - **Bilingual UI**: follows the system language by default — Chinese only when the system locale is Chinese, English otherwise. The panel title shows the current language; click the label (or use command mode `l`) to cycle through Auto / English / Chinese. The choice is saved to `aside.json`.
 
@@ -76,7 +77,8 @@ To quote the conversation: select text in the main transcript (fullscreen mode, 
 | `PageUp` / `PageDown` | Scroll the side answer |
 | `Alt+↑` / `Alt+↓` | Scroll one line |
 | `Ctrl+End` | Jump to the latest output |
-| `Ctrl+\` | Command mode, then: `q` quote · `t` snapshot · `r` refresh snapshot · `g` tools · `y` write back · `l` language (`Esc` cancels; frequent keys stay direct) |
+| `Ctrl+O` | Full-screen plain view of the active tab (`Esc` or `Ctrl+O` returns) |
+| `Ctrl+\` | Command mode, then: `q` quote · `t` snapshot · `r` refresh snapshot · `g` tools · `y` write back · `l` language · `f` fullscreen (`Esc` cancels; frequent keys stay direct) |
 
 The mouse wheel also scrolls. Left-click a tab title to switch tabs; click `snapshot` / `selection` / `tools` in the status line to toggle them; **Shift+click** `snapshot` to re-capture it; click the `write back` chip under the last answer to write it into the main conversation (**only this enters the main context**); click the language label in the title to cycle the language.
 

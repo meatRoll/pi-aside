@@ -88,6 +88,7 @@ import {
 	type Component,
 	type EditorTheme,
 	type Focusable,
+	type OverlayHandle,
 	type TUI,
 	type TuiMouseEvent,
 	type TuiMouseEventResult,
@@ -323,15 +324,15 @@ const EN_MESSAGES: UiMessages = {
 
 	hints: [
 		"enter send · shift+enter newline · esc close (keeps running) · ctrl+c cancel",
-		"shift+←/→ tabs · ctrl+n new · ctrl+x close · pgup/pgdn scroll",
+		"shift+←/→ tabs · ctrl+n new · ctrl+x close · pgup/pgdn scroll · ctrl+o fullscreen",
 		"ctrl+\\ commands: q quote · t snapshot · r refresh · g tools · y write back · l language",
 		"mouse: click a tab · chips toggle · shift+click snapshot refreshes · click write back under a reply",
 	],
 
 	commandHints: [
-		"command mode · q quote · t snapshot · r refresh snapshot · g tools · y write back · l language",
-		"esc cancels · frequent keys (send, tabs, scroll, cancel) stay direct",
-		"mouse: click a tab · chips toggle · shift+click snapshot refreshes · click write back under a reply",
+		"command mode · q quote · t snapshot · r refresh snapshot · g tools · y write back",
+		"l language · f fullscreen · esc cancels · send/tab/scroll keys stay direct",
+		"mouse: click a tab · chips toggle · shift+click snapshot refreshes · click write back",
 	],
 
 	emptyAsk: " Ask about the output in the main conversation.",
@@ -431,14 +432,14 @@ const ZH_MESSAGES: UiMessages = {
 
 	hints: [
 		"enter 发送 · shift+enter 换行 · esc 关闭（后台继续）· ctrl+c 取消生成",
-		"shift+←/→ 切换 tab · ctrl+n 新建 · ctrl+x 关闭 · pgup/pgdn 滚动",
+		"shift+←/→ 切换 tab · ctrl+n 新建 · ctrl+x 关闭 · pgup/pgdn 滚动 · ctrl+o 全屏",
 		"ctrl+\\ 指令：q 引用 · t 快照 · r 刷新 · g 工具 · y 写回 · l 语言",
 		"鼠标：点 tab 切换 · 点状态栏开关 · shift+点快照刷新 · 点回答下方的写回",
 	],
 
 	commandHints: [
-		"指令模式 · q 引用 · t 快照 · r 刷新快照 · g 工具 · y 写回主对话 · l 语言",
-		"esc 取消 · 常用键（发送/tab/滚动/取消）仍是直接快捷键",
+		"指令模式 · q 引用 · t 快照 · r 刷新快照 · g 工具 · y 写回主对话",
+		"l 语言 · f 全屏 · esc 取消 · 发送/tab/滚动 仍是直接快捷键",
 		"鼠标：点 tab 切换 · 点状态栏开关 · shift+点快照刷新 · 点回答下方的写回",
 	],
 
@@ -814,6 +815,8 @@ interface AsidePart {
 	detail?: string;
 	/** View-side component, reused across panel lifetimes */
 	markdown?: Markdown;
+	/** Text last handed to `markdown`, so unchanged parts keep their render cache */
+	markdownText?: string;
 }
 
 interface AsideTurn {
@@ -2261,6 +2264,11 @@ class AsidePanel implements Component, Focusable {
 	private initialQuestion: string | undefined;
 	private disposed = false;
 	private commandMode = false;
+	/** Full-screen reading overlay, when open. */
+	private fullscreen: { handle: OverlayHandle } | undefined;
+	private fullscreenScrollTop = 0;
+	private fullscreenFollowEnd = true;
+	private fullscreenMaxOffset = 0;
 	/** Clickable regions recorded while rendering; rebuilt on every frame. */
 	private hits: PanelHit[] = [];
 
@@ -2289,6 +2297,7 @@ class AsidePanel implements Component, Focusable {
 	dispose(): void {
 		if (this.disposed) return;
 		this.disposed = true;
+		this.closeFullscreen();
 		this.saveDraft();
 		this.runtime.clearRender?.();
 		this.runtime.panelOpen = false;
@@ -2368,6 +2377,10 @@ class AsidePanel implements Component, Focusable {
 			this.requestRender();
 			return;
 		}
+		if (matchesKey(data, "ctrl+o")) {
+			this.openFullscreen();
+			return;
+		}
 
 		this.editor.handleInput(data);
 		this.requestRender();
@@ -2403,6 +2416,7 @@ class AsidePanel implements Component, Focusable {
 		else if (matchesKey(data, "g")) this.toggleTools();
 		else if (matchesKey(data, "y")) this.promote();
 		else if (matchesKey(data, "l")) this.toggleLanguage();
+		else if (matchesKey(data, "f")) this.openFullscreen();
 		else this.setStatusNote(t().noteUnknownCommand);
 		this.requestRender();
 	}
@@ -2591,6 +2605,90 @@ class AsidePanel implements Component, Focusable {
 		tab.scrollTop = next;
 		if (next >= this.lastMaxOffset) tab.followEnd = true;
 		this.requestRender();
+	}
+
+	// Fullscreen view -------------------------------------------------------
+
+	/**
+	 * Open the active tab as plain text over the whole terminal, like peeking at the
+	 * transcript: no frame, title, status line, editor, or hints, so terminal
+	 * selection copies only the answer. Esc (or Ctrl+O again) returns to the panel.
+	 */
+	private openFullscreen(): void {
+		if (this.fullscreen) return;
+		this.fullscreenScrollTop = 0;
+		this.fullscreenFollowEnd = true;
+		this.fullscreenMaxOffset = 0;
+		const view: Component & Focusable = {
+			focused: false,
+			render: (width: number) => this.renderFullscreen(width),
+			invalidate: () => {},
+			handleInput: (data: string) => this.handleFullscreenInput(data),
+			handleMouse: (event: TuiMouseEvent): TuiMouseEventResult | undefined => {
+				if (event.type !== "wheel") return undefined;
+				this.scrollFullscreen(event.wheelDelta ?? 0);
+				return { handled: true, render: true };
+			},
+		};
+		const handle = this.tui.showOverlay(view, {
+			anchor: "top-left",
+			width: "100%",
+			maxHeight: "100%",
+			margin: 0,
+		});
+		this.fullscreen = { handle };
+		this.requestRender();
+	}
+
+	private closeFullscreen(): void {
+		const fullscreen = this.fullscreen;
+		if (!fullscreen) return;
+		this.fullscreen = undefined;
+		// Hiding restores focus to the panel overlay underneath.
+		fullscreen.handle.hide();
+		this.requestRender();
+	}
+
+	private renderFullscreen(width: number): string[] {
+		const height = Math.max(1, this.tui.terminal.rows);
+		const conversation = this.renderConversation(Math.max(1, width), false);
+		this.fullscreenMaxOffset = Math.max(0, conversation.lines.length - height);
+		if (this.fullscreenFollowEnd) this.fullscreenScrollTop = this.fullscreenMaxOffset;
+		this.fullscreenScrollTop = Math.max(0, Math.min(this.fullscreenScrollTop, this.fullscreenMaxOffset));
+		const visible = conversation.lines.slice(this.fullscreenScrollTop, this.fullscreenScrollTop + height);
+		while (visible.length < height) visible.push("");
+		return visible;
+	}
+
+	private scrollFullscreen(lines: number): void {
+		if (lines === 0) return;
+		this.fullscreenFollowEnd = false;
+		const next = Math.max(0, Math.min(this.fullscreenMaxOffset, this.fullscreenScrollTop + lines));
+		this.fullscreenScrollTop = next;
+		if (next >= this.fullscreenMaxOffset) this.fullscreenFollowEnd = true;
+		this.requestRender();
+	}
+
+	private handleFullscreenInput(data: string): void {
+		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+o")) {
+			this.closeFullscreen();
+			return;
+		}
+		const page = Math.max(1, this.tui.terminal.rows - 2);
+		if (matchesKey(data, "pageUp")) this.scrollFullscreen(-page);
+		else if (matchesKey(data, "pageDown")) this.scrollFullscreen(page);
+		else if (matchesKey(data, "alt+up")) this.scrollFullscreen(-1);
+		else if (matchesKey(data, "alt+down")) this.scrollFullscreen(1);
+		else if (matchesKey(data, "ctrl+home")) {
+			this.fullscreenFollowEnd = false;
+			this.fullscreenScrollTop = 0;
+			this.requestRender();
+		} else if (matchesKey(data, "ctrl+end")) {
+			this.fullscreenFollowEnd = true;
+			this.requestRender();
+		} else {
+			this.requestRender();
+		}
 	}
 
 	private requestRender(): void {
@@ -2782,7 +2880,10 @@ class AsidePanel implements Component, Focusable {
 		return truncateToWidth(` ${rendered.join("")}`, width, "");
 	}
 
-	private renderConversation(width: number): {
+	private renderConversation(
+		width: number,
+		withActions = true,
+	): {
 		lines: string[];
 		promote?: { line: number; x: number; width: number };
 	} {
@@ -2848,7 +2949,10 @@ class AsidePanel implements Component, Focusable {
 				}
 				if (!part.text.trim()) continue;
 				part.markdown = part.markdown ?? new Markdown(part.text, 0, 0, this.mdTheme);
-				part.markdown.setText(part.text);
+				if (part.markdownText !== part.text) {
+					part.markdown.setText(part.text);
+					part.markdownText = part.text;
+				}
 				for (const line of part.markdown.render(contentWidth)) lines.push(`  ${line}`);
 			}
 
@@ -2859,7 +2963,7 @@ class AsidePanel implements Component, Focusable {
 
 			if (turn.error) lines.push(theme.fg("error", `  ⚠ ${turn.error}`));
 
-			if (turn === promotable) {
+			if (withActions && turn === promotable) {
 				const label = ` ${t().promoteAction} `;
 				lines.push("");
 				promote = { line: lines.length, x: 3, width: visibleWidth(label) };
