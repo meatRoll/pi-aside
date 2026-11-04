@@ -5,8 +5,8 @@
  * requests can keep running in the background.
  *
  * Isolation
- * - Side requests call modelRegistry.streamSimple() directly, bypassing
- *   session.prompt(): nothing is written to the session file and the main
+ * - Each tab is a separate pi AgentSession with its own SessionManager and
+ *   session file. Side requests never touch the main session file and the main
  *   agent is never steered or queued.
  * - The side agent runs its own tool loop with a closed set of read-only tools:
  *   read, grep, find, ls, git, and (optional) web_fetch. It has no bash, edit,
@@ -22,16 +22,19 @@
  *   where Pi owns the selection; regular mode leaves selection to the terminal.
  * - The panel is an overlay: the transcript does not scroll or reflow.
  * - Everything else follows the main conversation: the side model defaults to the
- *   main model, the thinking level is the main session's, and the replay is
- *   compacted with whatever policy the main conversation uses (pi-compactor if it
- *   owns compaction, otherwise pi's own `compaction` settings). Tools are never
- *   withdrawn mid-turn, so the provider keeps parsing tool calls.
+ *   main model and the thinking level is the main session's. Compaction belongs
+ *   to the side pi session, so it uses pi's normal automatic compaction instead
+ *   of an Aside-specific implementation. Tools are never withdrawn mid-turn, so
+ *   the provider keeps parsing tool calls.
  *
  * Lifecycle
  * - Esc only hides the panel; the request keeps streaming in the background
  *   and the footer shows progress.
- * - Ctrl+C cancels the active tab; Ctrl+X closes a tab.
- * - State is discarded only on session switch (/new, /resume, /fork) or exit.
+ * - Ctrl+C cancels the active tab; Ctrl+X closes a tab and deletes its side
+ *   session.
+ * - Side sessions live under ~/.pi/agent/aside/sessions/<main-session-id> and are
+ *   associated with the main session through their header's parentSession. Reopening
+ *   or resuming the main session restores the tabs and their history.
  *
  * Usage
  * - /aside [question]              open the panel, optionally with a question
@@ -44,36 +47,29 @@
  */
 
 import { execFile, execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
 import { lookup } from "node:dns/promises";
-import { mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { isIP } from "node:net";
 import { join, resolve } from "node:path";
 
-import type {
-	AssistantMessage,
-	ImageContent,
-	Message,
-	TextContent,
-	ToolCall,
-	UserMessage,
-} from "@earendil-works/pi-ai";
-import { isContextOverflow } from "@earendil-works/pi-ai";
+import type { AssistantMessage, ImageContent, TextContent, ToolCall } from "@earendil-works/pi-ai";
 import {
-	createFindToolDefinition,
-	createGrepToolDefinition,
-	createLsToolDefinition,
-	createReadToolDefinition,
-	DEFAULT_COMPACTION_SETTINGS,
+	createAgentSession,
+	createExtensionRuntime,
+	createSyntheticSourceInfo,
+	type AgentSession,
+	type Extension,
 	type ExtensionAPI,
 	type ExtensionCommandContext,
 	type ExtensionContext,
-	type ExtensionToolContext,
 	type ExtensionUIContext,
-	generateSummary,
 	getAgentDir,
 	getMarkdownTheme,
 	getSelectListTheme,
+	type LoadExtensionsResult,
+	type ModelRuntime,
+	type ResourceLoader,
+	SessionManager,
 	type Theme,
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
@@ -811,6 +807,7 @@ interface AsidePart {
 	kind: "text" | "tool";
 	text: string;
 	toolName?: string;
+	toolCallId?: string;
 	status?: "running" | "ok" | "error";
 	detail?: string;
 	/** View-side component, reused across panel lifetimes */
@@ -835,14 +832,14 @@ interface AsideTab {
 	id: string;
 	title?: string;
 	turns: AsideTurn[];
-	/** Flat replay sent to the model; compaction rewrites this array only */
-	messages: Message[];
-	/** Latest compaction summary, fed back as previous summary */
-	summary?: string;
-	/** The user message that carries `summary` at the head of `messages` */
-	summaryMessage?: UserMessage;
+	/** Persisted pi session backing this tab, created on the first question */
+	session?: AgentSession;
+	sessionPath?: string;
+	sessionPromise?: Promise<AgentSession>;
+	unsubscribe?: () => void;
+	/** Set when the tab is closed while its session is still being created */
+	closed?: boolean;
 	status: "idle" | "thinking" | "streaming" | "compacting";
-	abort?: AbortController;
 	/** Unsent input, saved per tab */
 	draft: string;
 	snapshot?: Snapshot;
@@ -863,13 +860,12 @@ interface AsideTab {
 
 interface SessionRuntime {
 	sessionId: string;
+	/** Main session file; side sessions are associated with it via parentSession */
+	sessionFile?: string;
 	ui: ExtensionUIContext;
 	modelRegistry: ExtensionContext["modelRegistry"];
 	/** Live main-session context, for thinking level and settings reads */
 	ctx: ExtensionContext;
-	/** Cached pi-compactor repository key; null when unavailable */
-	repositoryId?: string | null;
-	getSettings: ExtensionAPI["getSettings"];
 	config: AsideConfig;
 	cwd: string;
 	captureSnapshot: () => Snapshot | undefined;
@@ -878,12 +874,34 @@ interface SessionRuntime {
 	tabs: AsideTab[];
 	activeId: string;
 	panelOpen: boolean;
+	/** Persisted tabs are restored once per main session */
+	restored?: Promise<void>;
 	requestRender?: () => void;
 	requestRenderSoon?: () => void;
 	clearRender?: () => void;
 }
 
 const runtimes = new Map<string, SessionRuntime>();
+
+// pi can briefly hand extension commands a stale context while a session is
+// being replaced, and cached runtimes survive /reload. session_start always
+// receives a fresh context, so keep the latest one and rebind cached runtimes
+// to it when a command arrives with a stale or replaced context.
+let latestContext: ExtensionContext | undefined;
+
+function contextIsStale(ctx: ExtensionContext): boolean {
+	try {
+		ctx.sessionManager.getSessionId();
+		return false;
+	} catch {
+		return true;
+	}
+}
+
+function resolveContext(ctx: ExtensionContext): ExtensionContext {
+	if (!contextIsStale(ctx)) return ctx;
+	return latestContext && !contextIsStale(latestContext) ? latestContext : ctx;
+}
 
 function sessionKey(ctx: ExtensionContext): string {
 	try {
@@ -899,6 +917,10 @@ function activeTab(runtime: SessionRuntime): AsideTab {
 
 function tabTitle(tab: AsideTab, index: number): string {
 	return tab.title ?? t().tabTitle(index);
+}
+
+function titleFromQuestion(question: string): string {
+	return question.replace(/\s+/g, " ").slice(0, uiLanguage === "zh" ? 18 : 28);
 }
 
 /** The last assistant text segment, excluding pre-tool narration. */
@@ -927,7 +949,6 @@ function createTab(
 	return {
 		id: `tab-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
 		turns: [],
-		messages: [],
 		status: "idle",
 		draft: "",
 		snapshot,
@@ -976,32 +997,47 @@ function consumeTabSelection(tab: AsideTab): void {
 	tab.useSelection = false;
 }
 
-function getRuntime(
-	ctx: ExtensionContext,
-	config: AsideConfig,
-	getSettings: ExtensionAPI["getSettings"],
-): SessionRuntime {
-	const key = sessionKey(ctx);
+function getRuntime(ctx: ExtensionContext, config: AsideConfig): SessionRuntime {
+	const liveCtx = resolveContext(ctx);
+	const key = sessionKey(liveCtx);
 	let runtime = runtimes.get(key);
-	if (runtime) return runtime;
+	if (runtime) {
+		// Refresh bindings that belong to the current session object. This also
+		// recovers from a stale command context without losing the runtime state.
+		runtime.ui = liveCtx.ui;
+		runtime.modelRegistry = liveCtx.modelRegistry;
+		runtime.ctx = liveCtx;
+		runtime.captureSnapshot = () =>
+			captureSnapshot(liveCtx, config.maxContextChars ?? DEFAULTS.maxContextChars);
+		try {
+			runtime.sessionFile = liveCtx.sessionManager.getSessionFile() ?? runtime.sessionFile;
+		} catch {
+			// Keep the previous file if the context cannot provide one.
+		}
+		return runtime;
+	}
+
+	let sessionFile: string | undefined;
+	try {
+		sessionFile = liveCtx.sessionManager.getSessionFile();
+	} catch {
+		sessionFile = undefined;
+	}
 
 	runtime = {
 		sessionId: key,
-		ui: ctx.ui,
-		modelRegistry: ctx.modelRegistry,
-		ctx,
-		getSettings,
+		sessionFile,
+		ui: liveCtx.ui,
+		modelRegistry: liveCtx.modelRegistry,
+		ctx: liveCtx,
 		config,
-		cwd: ctx.cwd,
-		captureSnapshot: () => captureSnapshot(ctx, config.maxContextChars ?? DEFAULTS.maxContextChars),
-		model: ctx.model,
+		cwd: liveCtx.cwd,
+		captureSnapshot: () => captureSnapshot(liveCtx, config.maxContextChars ?? DEFAULTS.maxContextChars),
+		model: liveCtx.model,
 		tabs: [],
 		activeId: "",
 		panelOpen: false,
 	};
-	const first = createTab(runtime);
-	runtime.tabs.push(first);
-	runtime.activeId = first.id;
 	runtimes.set(key, runtime);
 	return runtime;
 }
@@ -1069,23 +1105,6 @@ function buildSystemPrompt(tab: AsideTab, runtime: SessionRuntime, toolsEnabled:
 	return sections.join("\n\n");
 }
 
-/** Same preamble pi puts in front of a compaction summary. */
-const COMPACTION_SUMMARY_PREFIX = `The conversation history before this point was compacted into the following summary:
-
-<summary>
-`;
-
-const COMPACTION_SUMMARY_SUFFIX = `
-</summary>`;
-
-function compactionSummaryMessage(summary: string, timestamp = Date.now()): UserMessage {
-	return {
-		role: "user",
-		content: [{ type: "text", text: COMPACTION_SUMMARY_PREFIX + summary + COMPACTION_SUMMARY_SUFFIX }],
-		timestamp,
-	};
-}
-
 /** The main session's thinking level, so side requests reason as hard as the main chat. */
 type MainThinkingLevel = Exclude<NonNullable<ExtensionContext["thinkingLevel"]>, "off">;
 
@@ -1109,266 +1128,426 @@ function liveModel(runtime: SessionRuntime): NonNullable<SessionRuntime["model"]
 }
 
 // ---------------------------------------------------------------------------
-// Context compaction (same settings and summarizer as the main conversation)
+// Side pi sessions
 // ---------------------------------------------------------------------------
 
-/** CJK codepoints cost roughly one token each; other characters roughly a quarter. */
-function textTokens(text: string): number {
-	let cjk = 0;
-	let other = 0;
-	for (const char of text) {
-		if ((char.codePointAt(0) ?? 0) >= 0x2e80) cjk += 1;
-		else other += 1;
-	}
-	return Math.ceil(cjk + other / 4);
+/** Side sessions live outside the normal session picker, grouped by the main session id. */
+function asideSessionDir(sessionId: string): string {
+	const dir = join(getAgentDir(), "aside", "sessions", sessionId);
+	mkdirSync(dir, { recursive: true });
+	return dir;
 }
 
-function messageTokens(message: Message): number {
-	if (message.role === "assistant") {
-		let tokens = 0;
-		for (const block of message.content) {
-			if (block.type === "text") tokens += textTokens(block.text);
-			else if (block.type === "thinking") tokens += textTokens(block.thinking);
-			else if (block.type === "toolCall") tokens += textTokens(block.name) + textTokens(JSON.stringify(block.arguments));
-		}
-		return tokens;
-	}
-	if (message.role === "toolResult") {
-		let tokens = 0;
-		for (const block of message.content) {
-			// Attached images cost a flat estimate; the text is what actually grows.
-			if (block.type === "text") tokens += textTokens(block.text);
-			else tokens += 1_200;
-		}
-		return tokens;
-	}
-	return textTokens(contentText(message.content));
+/** Share the main session's provider/auth runtime so custom providers and /model changes carry over. */
+function sharedModelRuntime(runtime: SessionRuntime): ModelRuntime | undefined {
+	return (runtime.modelRegistry as unknown as { runtime?: ModelRuntime }).runtime;
 }
 
-function replayTokens(messages: Message[], systemPrompt: string, toolsJson: string): number {
-	let tokens = textTokens(systemPrompt) + textTokens(toolsJson);
-	for (const message of messages) tokens += messageTokens(message);
-	return tokens;
+function sideToolNames(runtime: SessionRuntime): string[] {
+	const names = ["read", "grep", "find", "ls"];
+	if (runtime.config.git !== false) names.push("git");
+	if (runtime.config.network !== false) names.push("web_fetch");
+	return names;
 }
 
-/** Keep about `keepRecentTokens` of recent messages, cutting at an assistant message so calls keep their results. */
-function findCompactCut(messages: Message[], keepRecentTokens: number): number {
-	let accumulated = 0;
-	let cut = -1;
-	for (let index = messages.length - 1; index >= 0; index -= 1) {
-		accumulated += messageTokens(messages[index]!);
-		if (accumulated >= keepRecentTokens) {
-			cut = index;
-			break;
-		}
-	}
-	if (cut < 0) return -1;
-	// Snap back to the assistant message that owns these tool results, so no call loses its result.
-	while (cut > 0 && messages[cut]?.role !== "assistant") cut -= 1;
-	return cut;
-}
-
-interface MainCompactionSettings {
-	enabled?: boolean;
-	reserveTokens?: number;
-	keepRecentTokens?: number;
-	modelOverrides?: Record<string, { reserveTokens?: number; keepRecentTokens?: number }>;
-}
-
-/** pi's own `compaction` settings, used when nothing else manages the main conversation's compaction. */
-function nativeCompactionSettings(runtime: SessionRuntime, model: NonNullable<SessionRuntime["model"]>) {
-	const configured = runtime.getSettings().compaction as MainCompactionSettings | undefined;
-	const override = configured?.modelOverrides?.[`${model.provider}/${model.id}`];
+/**
+ * A tiny resource loader for a side session: no extensions, skills, prompts, themes, or
+ * project context files are discovered. The inline handler owns the Aside system prompt
+ * and enforces the tool-result character budget on every tool.
+ */
+function createAsideResourceLoader(runtime: SessionRuntime, tab: AsideTab): ResourceLoader {
+	const extension: Extension = {
+		path: "<aside-side>",
+		resolvedPath: "<aside-side>",
+		sourceInfo: createSyntheticSourceInfo("<aside-side>", { source: "aside" }),
+		handlers: new Map([
+			[
+				"before_agent_start",
+				[
+					async () => ({
+						systemPrompt: buildSystemPrompt(tab, runtime, tab.useTools),
+					}),
+				],
+			],
+			[
+				"tool_result",
+				[
+					async (event: unknown) => {
+						const content = (event as { content?: (TextContent | ImageContent)[] }).content;
+						if (!Array.isArray(content)) return undefined;
+						const maxChars = runtime.config.maxToolResultChars ?? DEFAULTS.maxToolResultChars;
+						return { content: clipToolContent(content, maxChars) };
+					},
+				],
+			],
+		]) as Extension["handlers"],
+		tools: new Map(),
+		messageRenderers: new Map(),
+		commands: new Map(),
+		flags: new Map(),
+		shortcuts: new Map(),
+	};
+	const extensions: LoadExtensionsResult = {
+		extensions: [extension],
+		errors: [],
+		runtime: createExtensionRuntime(),
+	};
 	return {
-		enabled: configured?.enabled ?? DEFAULT_COMPACTION_SETTINGS.enabled,
-		reserveTokens: override?.reserveTokens ?? configured?.reserveTokens ?? DEFAULT_COMPACTION_SETTINGS.reserveTokens,
-		keepRecentTokens:
-			override?.keepRecentTokens ?? configured?.keepRecentTokens ?? DEFAULT_COMPACTION_SETTINGS.keepRecentTokens,
+		getExtensions: () => extensions,
+		getSkills: () => ({ skills: [], diagnostics: [] }),
+		getPrompts: () => ({ prompts: [], diagnostics: [] }),
+		getThemes: () => ({ themes: [], diagnostics: [] }),
+		getAgentsFiles: () => ({ agentsFiles: [] }),
+		getSystemPrompt: () => undefined,
+		getSystemPromptSource: () => undefined,
+		getAppendSystemPrompt: () => [],
+		getAppendSystemPromptSources: () => [],
+		extendResources: () => {},
+		reload: async () => {},
 	};
 }
 
-// ---------------------------------------------------------------------------
-// pi-compactor policy (the main conversation's compaction when the plugin owns it)
-// ---------------------------------------------------------------------------
+async function ensureTabSession(runtime: SessionRuntime, tab: AsideTab): Promise<AgentSession> {
+	if (tab.session) return tab.session;
+	if (tab.sessionPromise) return tab.sessionPromise;
 
-interface CompactorAmount {
-	unit?: string;
-	value?: number;
+	const promise = (async () => {
+		const model = liveModel(runtime);
+		if (!model) throw new Error(t().noModel);
+		runtime.model = model;
+
+		const sessionManager = tab.sessionPath
+			? SessionManager.open(tab.sessionPath)
+			: runtime.sessionFile
+				? SessionManager.create(runtime.cwd, asideSessionDir(runtime.sessionId), {
+						id: tab.id,
+						parentSession: runtime.sessionFile,
+					})
+				: SessionManager.inMemory(runtime.cwd, { id: tab.id });
+
+		const { session } = await createAgentSession({
+			cwd: runtime.cwd,
+			...(sharedModelRuntime(runtime) ? { modelRuntime: sharedModelRuntime(runtime) } : {}),
+			model,
+			thinkingLevel: thinkingLevel(runtime),
+			sessionManager,
+			resourceLoader: createAsideResourceLoader(runtime, tab),
+			tools: sideToolNames(runtime),
+			customTools: sideCustomTools(runtime),
+		});
+
+		// Cap normal side answers without touching the larger summaries pi generates for compaction.
+		const maxAnswerTokens = runtime.config.maxAnswerTokens;
+		if (maxAnswerTokens && maxAnswerTokens > 0) {
+			const stream = session.agent.streamFunction;
+			const sessionId = session.sessionId;
+			session.agent.streamFunction = (model, context, options) =>
+				stream(
+					model,
+					context,
+					options?.sessionId === sessionId ? { ...options, maxTokens: maxAnswerTokens } : options,
+				);
+		}
+
+		if (tab.closed) {
+			session.dispose();
+			throw new Error(t().requestCancelled);
+		}
+
+		tab.session = session;
+		tab.sessionPath = session.sessionFile ?? tab.sessionPath;
+		tab.unsubscribe = wireTabSession(runtime, tab, session);
+		if (tab.turns.length === 0) {
+			const restored = turnsFromSession(session.sessionManager);
+			tab.turns = restored.turns;
+			tab.usageIn = restored.usageIn;
+			tab.usageOut = restored.usageOut;
+			const question = tab.turns[0]?.question;
+			if (!tab.title && question) tab.title = titleFromQuestion(question);
+		}
+		return session;
+	})();
+
+	tab.sessionPromise = promise;
+	try {
+		return await promise;
+	} finally {
+		if (tab.sessionPromise === promise) tab.sessionPromise = undefined;
+	}
 }
 
-interface CompactorRule {
-	trigger?: CompactorAmount;
-	target?: CompactorAmount;
-}
-
-interface CompactorLayer {
-	all?: CompactorRule;
-	models?: Record<string, CompactorRule>;
-}
-
-interface CompactorConfig {
-	version?: number;
-	automatic?: boolean;
-	global?: CompactorLayer;
-	repositories?: Record<string, CompactorLayer>;
-}
-
-interface CompactionPolicy {
-	/** Fold once the replay grows past this many tokens. */
-	triggerTokens: number;
-	/** Target size after folding, including the system prompt. */
-	targetTokens: number;
-	/** Whether the proactive trigger is on; overflow recovery ignores this. */
-	automatic: boolean;
-}
-
-/** pi-compactor refuses to trigger below this, so match it. */
-const COMPACTOR_MIN_TRIGGER = 20_000;
-
-function amountTokens(amount: CompactorAmount | undefined, contextWindow: number): number | undefined {
-	if (typeof amount?.value !== "number" || !Number.isFinite(amount.value) || amount.value <= 0) return undefined;
-	return amount.unit === "percent" ? Math.ceil((contextWindow * amount.value) / 100) : Math.round(amount.value);
-}
-
-/** Mirrors pi-compactor's `resolve()`: global layer, then repository layer, `all` then per-model rules. */
-function resolveCompactorPolicy(
-	config: CompactorConfig | undefined,
-	repository: string | undefined,
-	model: NonNullable<SessionRuntime["model"]>,
-): CompactionPolicy | undefined {
-	if (config?.version !== 1) return undefined;
-	let trigger: number | undefined;
-	let target: number | undefined;
-	for (const layer of [config.global, repository ? config.repositories?.[repository] : undefined]) {
-		if (!layer) continue;
-		for (const key of [undefined, `${model.provider}/${model.id}`]) {
-			const rule = key ? layer.models?.[key] : layer.all;
-			trigger = amountTokens(rule?.trigger, model.contextWindow) ?? trigger;
-			target = amountTokens(rule?.target, model.contextWindow) ?? target;
+async function syncSideSession(runtime: SessionRuntime, tab: AsideTab, session: AgentSession): Promise<void> {
+	const model = liveModel(runtime);
+	if (model) {
+		runtime.model = model;
+		if (session.model?.provider !== model.provider || session.model?.id !== model.id) {
+			await session.setModel(model);
 		}
 	}
-	const triggerTokens = Math.max(COMPACTOR_MIN_TRIGGER, trigger ?? Math.ceil(model.contextWindow * 0.8));
-	const targetTokens = target ?? COMPACTOR_MIN_TRIGGER;
-	if (targetTokens >= triggerTokens) return undefined;
-	return { triggerTokens, targetTokens, automatic: config.automatic !== false };
+	session.setThinkingLevel(thinkingLevel(runtime) ?? "off");
+	session.setActiveToolsByName(tab.useTools ? sideToolNames(runtime) : []);
 }
 
-function readJsonFile<T>(path: string): T | undefined {
-	try {
-		return JSON.parse(readFileSync(path, "utf8")) as T;
-	} catch {
-		return undefined;
-	}
-}
+function turnsFromSession(sessionManager: SessionManager): {
+	turns: AsideTurn[];
+	usageIn: number;
+	usageOut: number;
+} {
+	const turns: AsideTurn[] = [];
+	const partsById = new Map<string, AsidePart>();
+	let current: AsideTurn | undefined;
+	let usageIn = 0;
+	let usageOut = 0;
 
-/** The key pi-compactor uses for repository rules: sha256 of the realpath of the git common dir. */
-function repositoryIdentity(cwd: string): string | undefined {
-	const candidates: string[] = [];
-	try {
-		const common = execFileSync("git", ["rev-parse", "--git-common-dir"], { cwd, encoding: "utf8", timeout: 5_000 });
-		candidates.push(resolve(cwd, common.trim()));
-	} catch {
-		// Not a repository: pi-compactor hashes the working directory instead.
-	}
-	candidates.push(cwd);
-	for (const candidate of candidates) {
-		try {
-			return createHash("sha256").update(realpathSync(candidate)).digest("hex");
-		} catch {
+	for (const entry of sessionManager.getBranch()) {
+		if (entry.type !== "message") continue;
+		const message = entry.message;
+
+		if (message.role === "user") {
+			const question = contentText(message.content).trim();
+			if (!question) continue;
+			current = { question, answer: "", parts: [] };
+			turns.push(current);
 			continue;
 		}
+		if (message.role === "assistant") {
+			if (!current) {
+				current = { question: "", answer: "", parts: [] };
+				turns.push(current);
+			}
+			const assistant = message as AssistantMessage;
+			for (const block of assistant.content) {
+				if (block.type === "text" && block.text.trim()) {
+					if (current.answer.trim()) current.answer += "\n\n";
+					current.parts.push({ kind: "text", text: block.text });
+					current.answer += block.text;
+				} else if (block.type === "thinking") {
+					current.thinkingChars = (current.thinkingChars ?? 0) + block.thinking.length;
+				} else if (block.type === "toolCall") {
+					const part: AsidePart = {
+						kind: "tool",
+						toolName: block.name,
+						toolCallId: block.id,
+						text: summarizeToolCall(block.name, block.arguments as Record<string, unknown>),
+						status: "running",
+					};
+					current.parts.push(part);
+					partsById.set(block.id, part);
+				}
+			}
+			if (current.startedAt === undefined) current.startedAt = assistant.timestamp;
+			usageIn += assistant.usage.input;
+			usageOut += assistant.usage.output;
+			if (assistant.stopReason === "error") current.error = assistant.errorMessage ?? t().requestFailed;
+			else if (assistant.stopReason === "aborted") current.error = t().requestCancelled;
+			else current.error = undefined;
+			continue;
+		}
+
+		if (message.role === "toolResult") {
+			const part = partsById.get(message.toolCallId);
+			if (part) {
+				part.status = message.isError ? "error" : "ok";
+				part.detail = summarizeToolResult(message.content, message.isError);
+			}
+		}
 	}
-	return undefined;
+
+	for (const part of partsById.values()) {
+		if (part.status !== "running") continue;
+		part.status = "error";
+		part.detail = t().requestCancelled;
+	}
+	if (current && !current.answer.trim() && !current.error) current.error = t().requestCancelled;
+
+	return { turns, usageIn, usageOut };
 }
 
-/** pi-compactor's policy when it owns compaction, otherwise undefined. */
-function compactorPolicy(runtime: SessionRuntime, model: NonNullable<SessionRuntime["model"]>): CompactionPolicy | undefined {
-	const dir = join(getAgentDir(), "compactor");
-	const lifecycle = readJsonFile<{ enabled?: boolean }>(join(dir, "lifecycle.json"));
-	if (!lifecycle || lifecycle.enabled === false) return undefined;
-	const config = readJsonFile<CompactorConfig>(join(dir, "settings.json"));
-	if (!config) return undefined;
-	if (runtime.repositoryId === undefined) runtime.repositoryId = repositoryIdentity(runtime.cwd) ?? null;
-	return resolveCompactorPolicy(config, runtime.repositoryId ?? undefined, model);
+function tabFromSession(runtime: SessionRuntime, sessionManager: SessionManager, path: string): AsideTab | undefined {
+	const restored = turnsFromSession(sessionManager);
+	if (restored.turns.length === 0) return undefined;
+	const question = restored.turns[0]?.question;
+	const header = sessionManager.getHeader();
+	const created = header?.timestamp ? new Date(header.timestamp) : undefined;
+	return {
+		id: sessionManager.getSessionId(),
+		title: question ? titleFromQuestion(question) : undefined,
+		turns: restored.turns,
+		sessionPath: path,
+		status: "idle",
+		draft: "",
+		useSelection: false,
+		useContext: false,
+		useTools: runtime.config.tools !== false,
+		followEnd: true,
+		scrollTop: 0,
+		usageIn: restored.usageIn,
+		usageOut: restored.usageOut,
+		unread: false,
+		createdAt: created && !Number.isNaN(created.getTime()) ? created.getTime() : Date.now(),
+	};
 }
 
-// ---------------------------------------------------------------------------
-// Compaction
-// ---------------------------------------------------------------------------
+async function restoreRuntimeTabs(runtime: SessionRuntime): Promise<void> {
+	if (runtime.restored) return runtime.restored;
+	runtime.restored = (async () => {
+		const loaded: AsideTab[] = [];
+		if (runtime.sessionFile) {
+			const dir = asideSessionDir(runtime.sessionId);
+			try {
+				for (const name of readdirSync(dir)) {
+					if (!name.endsWith(".jsonl")) continue;
+					const path = join(dir, name);
+					try {
+						if (statSync(path).size === 0) continue;
+						const tab = tabFromSession(runtime, SessionManager.open(path), path);
+						if (tab) loaded.push(tab);
+					} catch {
+						// Skip a corrupt side session; other tabs can still open.
+					}
+				}
+			} catch {
+				// An unreadable side-session directory must not prevent Aside from opening.
+			}
+		}
 
-/**
- * Fold the oldest part of the replay into a summary. The trigger and the retained size
- * come from whatever manages the main conversation (pi-compactor if it is installed,
- * otherwise pi's own `compaction` settings); the summary itself is pi's summarizer.
- * Display parts are never touched.
- */
-async function maybeCompact(
-	runtime: SessionRuntime,
-	tab: AsideTab,
-	model: NonNullable<SessionRuntime["model"]>,
-	systemPrompt: string,
-	toolsJson: string,
-	signal: AbortSignal,
-	options: { force?: boolean } = {},
-): Promise<boolean> {
-	const systemTokens = textTokens(systemPrompt);
-	const policy = compactorPolicy(runtime, model);
-	const native = nativeCompactionSettings(runtime, model);
-	let enabled: boolean;
-	let triggerTokens: number;
-	let keepTokens: number;
-	if (policy) {
-		enabled = options.force === true || policy.automatic;
-		triggerTokens = policy.triggerTokens;
-		// pi-compactor keeps room for the system prompt and the summary inside the target.
-		keepTokens = Math.max(0, policy.targetTokens - systemTokens - 4_096);
-	} else {
-		enabled = options.force === true || native.enabled;
-		triggerTokens = model.contextWindow - native.reserveTokens;
-		keepTokens = native.keepRecentTokens;
-	}
-	if (!enabled) return false;
-	if (!options.force && replayTokens(tab.messages, systemPrompt, toolsJson) <= triggerTokens) return false;
+		if (loaded.length > 0) {
+			loaded.sort((a, b) => a.createdAt - b.createdAt);
+			runtime.tabs = loaded.slice(-DEFAULTS.maxTabs);
+			runtime.activeId = runtime.tabs[runtime.tabs.length - 1]!.id;
+			return;
+		}
 
-	const cut = findCompactCut(tab.messages, keepTokens);
-	if (cut <= 0) return false;
-	// The previous summary is passed along separately instead of being summarized again.
-	const head = tab.messages.slice(0, cut).filter((message) => message !== tab.summaryMessage);
-	if (head.length === 0) return false;
+		if (runtime.tabs.length === 0) {
+			const first = createTab(runtime);
+			runtime.tabs.push(first);
+			runtime.activeId = first.id;
+		}
+	})();
+	return runtime.restored;
+}
 
-	tab.status = "compacting";
-	notifyTab(runtime, tab, false);
+function deleteSideSessionFile(tab: AsideTab): void {
+	const path = tab.sessionPath ?? tab.session?.sessionFile;
+	if (!path) return;
 	try {
-		const auth = await runtime.modelRegistry.getApiKeyAndHeaders(model);
-		if (!auth.ok || signal.aborted) return false;
-		const headers = auth.headers
-			? (Object.fromEntries(Object.entries(auth.headers).filter(([, value]) => value !== null)) as Record<string, string>)
-			: undefined;
-		const summary = await generateSummary(
-			head,
-			model,
-			undefined,
-			auth.apiKey,
-			headers,
-			signal,
-			undefined,
-			tab.summary,
-			thinkingLevel(runtime),
-			(target, context, options) => runtime.modelRegistry.stream(target, context, options),
-		);
-		if (signal.aborted) return false;
-		tab.summary = summary;
-		tab.summaryMessage = compactionSummaryMessage(summary);
-		tab.messages = [tab.summaryMessage, ...tab.messages.slice(cut)];
-		return true;
-	} catch (error) {
-		if (signal.aborted) return false;
-		const detail = error instanceof Error ? error.message : String(error);
-		runtime.ui.notify(`${t().statusCompacting} ${detail}`, "warning");
-		return false;
-	} finally {
-		tab.status = "thinking";
+		if (existsSync(path)) unlinkSync(path);
+	} catch {
+		// The file may already be gone or be in use; the tab is still closed.
 	}
+}
+
+function finishTurn(runtime: SessionRuntime, tab: AsideTab): void {
+	if (tab.status === "idle") return;
+	const turn = tab.turns[tab.turns.length - 1];
+	if (turn && !turn.answer.trim() && !turn.error) turn.error = t().emptyAnswer;
+	tab.status = "idle";
+	notifyTab(runtime, tab, true);
+}
+
+function wireTabSession(runtime: SessionRuntime, tab: AsideTab, session: AgentSession): () => void {
+	let textPart: AsidePart | undefined;
+	const toolParts = new Map<string, AsidePart>();
+
+	return session.subscribe((event) => {
+		const turn = tab.turns[tab.turns.length - 1];
+
+		switch (event.type) {
+			case "agent_start":
+				// The system prompt for this run has already been built, so a quoted
+				// selection was included. It is one-shot: later runs must not see it.
+				consumeTabSelection(tab);
+				tab.status = "thinking";
+				notifyTab(runtime, tab, false);
+				break;
+			case "message_start":
+				if (event.message.role === "assistant") {
+					textPart = undefined;
+					tab.status = "thinking";
+				}
+				break;
+			case "message_update": {
+				if (!turn) break;
+				const delta = event.assistantMessageEvent;
+				if (delta.type === "text_delta") {
+					if (!textPart) {
+						if (turn.answer.trim()) turn.answer += "\n\n";
+						textPart = { kind: "text", text: "" };
+						turn.parts.push(textPart);
+					}
+					textPart.text += delta.delta;
+					turn.answer += delta.delta;
+					tab.status = "streaming";
+					runtime.requestRenderSoon?.();
+				} else if (delta.type === "thinking_delta") {
+					turn.thinkingChars = (turn.thinkingChars ?? 0) + delta.delta.length;
+					runtime.requestRenderSoon?.();
+				}
+				break;
+			}
+			case "message_end": {
+				if (event.message.role !== "assistant" || !turn) break;
+				const final = event.message as AssistantMessage;
+				if (!textPart) {
+					const text = contentText(final.content).trim();
+					if (text) {
+						if (turn.answer.trim()) turn.answer += "\n\n";
+						turn.parts.push({ kind: "text", text });
+						turn.answer += text;
+					}
+				}
+				tab.usageIn += final.usage.input;
+				tab.usageOut += final.usage.output;
+				if (final.stopReason === "error") turn.error = final.errorMessage ?? t().requestFailed;
+				else if (final.stopReason === "aborted") turn.error = t().requestCancelled;
+				else turn.error = undefined;
+				const calls = final.content.filter((block): block is ToolCall => block.type === "toolCall");
+				if (calls.length === 0) discardLeakedToolMarkup(turn, final);
+				runtime.requestRenderSoon?.();
+				break;
+			}
+			case "tool_execution_start": {
+				if (!turn) break;
+				const part: AsidePart = {
+					kind: "tool",
+					toolName: event.toolName,
+					toolCallId: event.toolCallId,
+					text: summarizeToolCall(event.toolName, event.args as Record<string, unknown>),
+					status: "running",
+				};
+				turn.parts.push(part);
+				toolParts.set(event.toolCallId, part);
+				if (tab.status !== "compacting") tab.status = "streaming";
+				notifyTab(runtime, tab, false);
+				break;
+			}
+			case "tool_execution_end": {
+				const part = toolParts.get(event.toolCallId);
+				if (!part) break;
+				const content = Array.isArray(event.result?.content) ? event.result.content : [];
+				part.status = event.isError ? "error" : "ok";
+				part.detail = summarizeToolResult(content, event.isError);
+				runtime.requestRenderSoon?.();
+				break;
+			}
+			case "compaction_start":
+				tab.status = "compacting";
+				notifyTab(runtime, tab, false);
+				break;
+			case "compaction_end":
+				if (event.errorMessage) runtime.ui.notify(`${t().statusCompacting} ${event.errorMessage}`, "warning");
+				tab.status = event.willRetry ? "thinking" : session.isIdle ? "idle" : "thinking";
+				notifyTab(runtime, tab, false);
+				break;
+			case "auto_retry_start":
+				tab.status = "thinking";
+				notifyTab(runtime, tab, false);
+				break;
+			case "agent_settled":
+				finishTurn(runtime, tab);
+				break;
+		}
+	});
 }
 
 function firstLine(text: string, maxChars = 100): string {
@@ -1381,10 +1560,9 @@ function stringArg(args: Record<string, unknown>, key: string): string | undefin
 	return typeof value === "string" && value ? value : undefined;
 }
 
-function summarizeToolCall(call: ToolCall, maxChars = 90): string {
-	const args = call.arguments as Record<string, unknown>;
+function summarizeToolCall(name: string, args: Record<string, unknown>, maxChars = 90): string {
 	let summary: string;
-	switch (call.name) {
+	switch (name) {
 		case "read": {
 			const offset = typeof args.offset === "number" ? `:${args.offset}` : "";
 			summary = `read ${stringArg(args, "path") ?? "?"}${offset}`;
@@ -1407,7 +1585,7 @@ function summarizeToolCall(call: ToolCall, maxChars = 90): string {
 			summary = `web_fetch ${stringArg(args, "url") ?? "?"}`;
 			break;
 		default:
-			summary = `${call.name} ${firstLine(JSON.stringify(args), maxChars)}`;
+			summary = `${name} ${firstLine(JSON.stringify(args), maxChars)}`;
 	}
 	return summary.length > maxChars ? `${summary.slice(0, maxChars - 1)}…` : summary;
 }
@@ -1442,56 +1620,7 @@ function clipToolContent(
 	return output.length > 0 ? output : [{ type: "text", text: "(empty result)" }];
 }
 
-function toolResultMessage(
-	call: ToolCall,
-	result: { content?: (TextContent | ImageContent)[]; isError?: boolean; error?: string },
-	runtime: SessionRuntime,
-): Message {
-	const rawContent = result.content ?? [{ type: "text", text: result.error ?? "Tool failed" }];
-	const content = clipToolContent(
-		rawContent,
-		runtime.config.maxToolResultChars ?? DEFAULTS.maxToolResultChars,
-	);
-	return {
-		role: "toolResult",
-		toolCallId: call.id,
-		toolName: call.name,
-		content,
-		isError: result.isError === true || result.error !== undefined,
-		timestamp: Date.now(),
-	};
-}
-
 // --- Tools -----------------------------------------------------------------
-
-interface ToolOutcome {
-	content: (TextContent | ImageContent)[];
-	details?: unknown;
-	isError?: boolean;
-}
-
-interface AsideTool {
-	name: string;
-	description: string;
-	parameters: ToolDefinition["parameters"];
-	execute: (
-		call: ToolCall,
-		signal: AbortSignal | undefined,
-		ctx: ExtensionToolContext,
-	) => Promise<ToolOutcome>;
-}
-
-function wrapToolDefinition(definition: ToolDefinition<any, any>): AsideTool {
-	return {
-		name: definition.name,
-		description: definition.description,
-		parameters: definition.parameters,
-		execute: async (call, signal, ctx) => {
-			const result = await definition.execute(call.id, call.arguments as never, signal, undefined, ctx);
-			return { content: result.content, isError: result.isError };
-		},
-	};
-}
 
 /** Plain JSON Schema; extensions resolve `typebox` at runtime, but the source stays dependency-free. */
 const webFetchSchema = {
@@ -1669,14 +1798,15 @@ async function fetchDocument(rawUrl: string, outerSignal?: AbortSignal): Promise
 	}
 }
 
-function createWebFetchTool(config: AsideConfig): AsideTool {
+function createWebFetchTool(config: AsideConfig): ToolDefinition {
 	return {
 		name: "web_fetch",
+		label: "Web fetch",
 		description:
 			"Fetch a specific http(s) URL and return its readable text (HTML is converted to text). Only GET requests; localhost and private network addresses are refused. There is no web search.",
 		parameters: webFetchSchema,
-		async execute(call, signal) {
-			const args = call.arguments as { url?: unknown; maxChars?: unknown };
+		async execute(_toolCallId: string, params: unknown, signal: AbortSignal | undefined) {
+			const args = params as { url?: unknown; maxChars?: unknown };
 			if (typeof args.url !== "string" || !args.url) {
 				throw new Error("web_fetch needs a string `url`");
 			}
@@ -1927,14 +2057,15 @@ function buildGitCommand(args: Record<string, unknown>): string[] {
 	}
 }
 
-function createGitTool(cwd: string): AsideTool {
+function createGitTool(cwd: string): ToolDefinition {
 	return {
 		name: "git",
+		label: "Git (read-only)",
 		description:
 			"Read-only git history and commit data. show: commit metadata + patch (stat=true for diffstat only); log: history (rev, path, limit, stat); diff: from..to (from defaults HEAD~1, to working tree); blame: line history (path, rev); file: path content at rev; status; branches; tags; ls: recursive file list at rev. This tool cannot modify the repository.",
 		parameters: gitSchema,
-		async execute(call, signal) {
-			const args = call.arguments as Record<string, unknown>;
+		async execute(_toolCallId: string, params: unknown, signal: AbortSignal | undefined) {
+			const args = params as Record<string, unknown>;
 			const repoArg = typeof args.repo === "string" && args.repo.trim() ? args.repo.trim() : ".";
 			const repo = resolve(cwd, repoArg);
 			const maxLines = clampInt(args.maxLines, 400, 20, 2000);
@@ -1963,19 +2094,15 @@ function createGitTool(cwd: string): AsideTool {
 				return {
 					content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
 					isError: true,
+					details: undefined,
 				};
 			}
 		},
 	};
 }
 
-function buildToolDefinitions(runtime: SessionRuntime): AsideTool[] {
-	const definitions: AsideTool[] = [
-		wrapToolDefinition(createReadToolDefinition(runtime.cwd)),
-		wrapToolDefinition(createGrepToolDefinition(runtime.cwd)),
-		wrapToolDefinition(createFindToolDefinition(runtime.cwd)),
-		wrapToolDefinition(createLsToolDefinition(runtime.cwd)),
-	];
+function sideCustomTools(runtime: SessionRuntime): ToolDefinition[] {
+	const definitions: ToolDefinition[] = [];
 	if (runtime.config.git !== false) definitions.push(createGitTool(runtime.cwd));
 	if (runtime.config.network !== false) definitions.push(createWebFetchTool(runtime.config));
 	return definitions;
@@ -1994,7 +2121,32 @@ async function ask(runtime: SessionRuntime, tab: AsideTab, raw: string): Promise
 	}
 	runtime.model = model;
 
-	if (!tab.title) tab.title = question.replace(/\s+/g, " ").slice(0, uiLanguage === "zh" ? 18 : 28);
+	if (!tab.title) tab.title = titleFromQuestion(question);
+	tab.status = "thinking";
+	tab.followEnd = true;
+	tab.unread = false;
+	notifyTab(runtime, tab, false);
+
+	let session: AgentSession;
+	try {
+		session = await ensureTabSession(runtime, tab);
+		await syncSideSession(runtime, tab, session);
+	} catch (error) {
+		tab.turns.push({
+			question,
+			answer: "",
+			error: error instanceof Error ? error.message : String(error),
+			parts: [],
+			startedAt: Date.now(),
+		});
+		finishTurn(runtime, tab);
+		return;
+	}
+
+	if (tab.closed) {
+		tab.status = "idle";
+		return;
+	}
 
 	const turn: AsideTurn = {
 		question,
@@ -2003,178 +2155,17 @@ async function ask(runtime: SessionRuntime, tab: AsideTab, raw: string): Promise
 		thinkingChars: 0,
 		startedAt: Date.now(),
 	};
-	// Messages authored by this turn; dropped again when the turn produced no assistant reply.
-	const turnMessages: Message[] = [];
-	const userMessage: UserMessage = {
-		role: "user",
-		content: [{ type: "text", text: question }],
-		timestamp: Date.now(),
-	};
-	tab.messages.push(userMessage);
-	turnMessages.push(userMessage);
-
 	tab.turns.push(turn);
-	tab.status = "thinking";
 	tab.followEnd = true;
 	tab.unread = false;
 	notifyTab(runtime, tab, false);
 
-	const controller = new AbortController();
-	tab.abort = controller;
-
-	const toolDefinitions = tab.useTools ? buildToolDefinitions(runtime) : [];
-	const toolByName = new Map(toolDefinitions.map((definition) => [definition.name, definition]));
-	const toolDeclarations = toolDefinitions.map(({ name, description, parameters }) => ({
-		name,
-		description,
-		parameters,
-	}));
-	const useTools = toolDeclarations.length > 0;
-	const systemPrompt = buildSystemPrompt(tab, runtime, useTools);
-	// A quoted selection is one-shot: this request has it, later requests do not.
-	consumeTabSelection(tab);
-	const toolsJson = useTools ? JSON.stringify(toolDeclarations) : "";
-	const toolContext = { cwd: runtime.cwd, model } as unknown as ExtensionToolContext;
-	let overflowRetried = false;
-
-	try {
-		while (true) {
-			await maybeCompact(runtime, tab, model, systemPrompt, toolsJson, controller.signal);
-			if (controller.signal.aborted) break;
-			const stream = runtime.modelRegistry.streamSimple(
-				model,
-				{
-					systemPrompt,
-					messages: tab.messages,
-					tools: useTools ? toolDeclarations : undefined,
-				},
-				{
-					signal: controller.signal,
-					maxTokens: runtime.config.maxAnswerTokens,
-					reasoning: thinkingLevel(runtime),
-					thinkingBudgets: runtime.getSettings().thinkingBudgets,
-				},
-			);
-			tab.status = "streaming";
-			notifyTab(runtime, tab, false);
-
-			let final: AssistantMessage | undefined;
-			let textPart: AsidePart | undefined;
-			for await (const event of stream) {
-				if (event.type === "text_delta") {
-					if (!textPart) {
-						if (turn.answer.trim()) turn.answer += "\n\n";
-						textPart = { kind: "text", text: "" };
-						turn.parts.push(textPart);
-					}
-					textPart.text += event.delta;
-					turn.answer += event.delta;
-					runtime.requestRenderSoon?.();
-				} else if (event.type === "thinking_delta") {
-					turn.thinkingChars = (turn.thinkingChars ?? 0) + event.delta.length;
-					runtime.requestRenderSoon?.();
-				} else if (event.type === "done") {
-					final = event.message;
-					tab.usageIn += event.message.usage.input;
-					tab.usageOut += event.message.usage.output;
-				} else if (event.type === "error") {
-					turn.error = event.error.errorMessage ?? t().requestFailed;
-				}
-			}
-
-			if (!final) break;
-
-			// Some providers only attach text to the final message; show it if no deltas arrived.
-			if (!textPart) {
-				const text = contentText(final.content).trim();
-				if (text) {
-					if (turn.answer.trim()) turn.answer += "\n\n";
-					turn.parts.push({ kind: "text", text });
-					turn.answer += text;
-				}
-			}
-
-			if (final.stopReason === "error" && !overflowRetried && isContextOverflow(final, model.contextWindow)) {
-				// The failed request never entered the replay: fold the context and ask again.
-				overflowRetried = true;
-				if (await maybeCompact(runtime, tab, model, systemPrompt, toolsJson, controller.signal, { force: true })) {
-					turn.error = undefined;
-					continue;
-				}
-			}
-
-			const calls = final.content.filter((block): block is ToolCall => block.type === "toolCall");
-			if (calls.length === 0) discardLeakedToolMarkup(turn, final);
-			tab.messages.push(final);
-			turnMessages.push(final);
-			if (calls.length === 0) break;
-
-			for (let index = 0; index < calls.length; index++) {
-				const call = calls[index]!;
-				const part: AsidePart = {
-					kind: "tool",
-					toolName: call.name,
-					text: summarizeToolCall(call),
-					status: "running",
-				};
-				turn.parts.push(part);
-				runtime.requestRenderSoon?.();
-
-				const definition = toolByName.get(call.name);
-				let result: { content: (TextContent | ImageContent)[]; error?: string; isError?: boolean };
-				if (call.argumentsError) {
-					result = { content: [{ type: "text", text: call.argumentsError }], isError: true };
-				} else if (!definition) {
-					result = { content: [{ type: "text", text: `Unknown tool: ${call.name}` }], isError: true };
-				} else {
-					try {
-						result = await definition.execute(call, controller.signal, toolContext);
-					} catch (error) {
-						result = {
-							content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
-							isError: true,
-						};
-					}
-				}
-
-				part.status = result.isError ? "error" : "ok";
-				part.detail = summarizeToolResult(result.content, result.isError === true);
-
-				const message = toolResultMessage(call, result, runtime);
-				tab.messages.push(message);
-				turnMessages.push(message);
-				runtime.requestRenderSoon?.();
-
-				if (controller.signal.aborted) {
-					turn.error = t().requestCancelled;
-					// Keep the transcript valid: every tool call needs a result before the next turn.
-					for (const skipped of calls.slice(index + 1)) {
-						const skippedMessage = toolResultMessage(
-							skipped,
-							{ content: [{ type: "text", text: t().requestCancelled }], isError: true },
-							runtime,
-						);
-						tab.messages.push(skippedMessage);
-						turnMessages.push(skippedMessage);
-					}
-					break;
-				}
-			}
-
-			if (controller.signal.aborted) break;
-		}
-	} catch (error) {
-		if (controller.signal.aborted) turn.error = t().requestCancelled;
-		else turn.error = error instanceof Error ? error.message : String(error);
-	} finally {
-		if (tab.abort === controller) tab.abort = undefined;
-		if (!turnMessages.some((message) => message.role === "assistant")) {
-			tab.messages = tab.messages.filter((message) => !turnMessages.includes(message));
-		}
-		tab.status = "idle";
-		if (!turn.answer && !turn.error) turn.error = t().emptyAnswer;
-		notifyTab(runtime, tab, true);
-	}
+	// AgentSession persists the user message, runs the tool loop, and owns compaction.
+	void session.prompt(question).catch((error: unknown) => {
+		if (tab.status === "idle") return;
+		turn.error = error instanceof Error ? error.message : String(error);
+		finishTurn(runtime, tab);
+	});
 }
 
 // ---------------------------------------------------------------------------
@@ -2455,11 +2446,11 @@ class AsidePanel implements Component, Focusable {
 
 	private abortActive(): void {
 		const tab = activeTab(this.runtime);
-		if (!tab.abort) {
+		if (!tab.session || tab.status === "idle") {
 			this.setStatusNote(t().noteNoActiveRequest);
 			return;
 		}
-		tab.abort.abort();
+		void tab.session.abort();
 		this.setStatusNote(t().noteCancelled);
 	}
 
@@ -2494,7 +2485,24 @@ class AsidePanel implements Component, Focusable {
 		const index = runtime.tabs.indexOf(activeTab(runtime));
 		const tab = runtime.tabs[index];
 		if (!tab) return;
-		tab.abort?.abort();
+		tab.closed = true;
+		tab.unsubscribe?.();
+		tab.unsubscribe = undefined;
+		const session = tab.session;
+		if (session) {
+			void session
+				.abort()
+				.catch(() => undefined)
+				.finally(() => {
+					try {
+						session.dispose();
+					} finally {
+						deleteSideSessionFile(tab);
+					}
+				});
+		} else {
+			deleteSideSessionFile(tab);
+		}
 		runtime.tabs.splice(index, 1);
 
 		if (runtime.tabs.length === 0) {
@@ -3002,7 +3010,12 @@ export default function asideExtension(pi: ExtensionAPI) {
 			return;
 		}
 
-		const runtime = getRuntime(ctx, config, () => pi.getSettings());
+		const runtime = getRuntime(ctx, config);
+		if (runtime.panelOpen) {
+			ctx.ui.notify(t().alreadyOpen, "info");
+			return;
+		}
+		await restoreRuntimeTabs(runtime);
 		if (runtime.panelOpen) {
 			ctx.ui.notify(t().alreadyOpen, "info");
 			return;
@@ -3116,34 +3129,36 @@ export default function asideExtension(pi: ExtensionAPI) {
 	pi.registerCommand("aside-model", {
 		description: t().cmdAsideModel,
 		handler: async (args, ctx: ExtensionCommandContext) => {
+			const liveCtx = resolveContext(ctx);
 			const wanted = args?.trim();
 			if (wanted) {
 				const slash = wanted.indexOf("/");
-				const found = slash > 0 ? ctx.modelRegistry.find(wanted.slice(0, slash), wanted.slice(slash + 1)) : undefined;
+				const found =
+					slash > 0 ? liveCtx.modelRegistry.find(wanted.slice(0, slash), wanted.slice(slash + 1)) : undefined;
 				if (!found) {
-					ctx.ui.notify(t().modelNotFound(wanted), "error");
+					liveCtx.ui.notify(t().modelNotFound(wanted), "error");
 					return;
 				}
 				config.model = `${found.provider}/${found.id}`;
 				saveAsideConfig(config);
-				ctx.ui.notify(t().modelSet(config.model), "info");
+				liveCtx.ui.notify(t().modelSet(config.model), "info");
 				return;
 			}
 
-			const models = ctx.modelRegistry.getAvailable();
+			const models = liveCtx.modelRegistry.getAvailable();
 			if (models.length === 0) {
-				ctx.ui.notify(t().noModels, "error");
+				liveCtx.ui.notify(t().noModels, "error");
 				return;
 			}
 			const labels = models.map((model) => `${model.provider}/${model.id}`);
-			const current = config.model ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "");
-			const choice = await ctx.ui.select(t().modelSelectTitle(current || t().followMainModel), labels);
+			const current = config.model ?? (liveCtx.model ? `${liveCtx.model.provider}/${liveCtx.model.id}` : "");
+			const choice = await liveCtx.ui.select(t().modelSelectTitle(current || t().followMainModel), labels);
 			if (!choice) return;
 			const model = models[labels.indexOf(choice)];
 			if (!model) return;
 			config.model = `${model.provider}/${model.id}`;
 			saveAsideConfig(config);
-			ctx.ui.notify(t().modelSet(config.model), "info");
+			liveCtx.ui.notify(t().modelSet(config.model), "info");
 		},
 	});
 
@@ -3155,13 +3170,18 @@ export default function asideExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", (_event, ctx) => {
+		latestContext = ctx;
 		if (!ctx.hasUI) return;
 		ctx.ui.setStatus("aside", t().footerIdle);
 	});
 
 	pi.on("session_shutdown", () => {
 		for (const runtime of runtimes.values()) {
-			for (const tab of runtime.tabs) tab.abort?.abort();
+			for (const tab of runtime.tabs) {
+				tab.closed = true;
+				tab.unsubscribe?.();
+				tab.session?.dispose();
+			}
 			runtime.clearRender?.();
 		}
 		runtimes.clear();
