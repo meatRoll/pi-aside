@@ -13,7 +13,7 @@
  *   or write tool, so it cannot modify files or run commands.
  * - Opening a tab captures a read-only snapshot (the last assistant reply plus
  *   the preceding user request) and sends it as part of the system prompt. The
- *   snapshot is a copy; refresh it with Ctrl+R when the main chat changes.
+ *   snapshot is a copy; refresh it from command mode (r) or shift+click its chip.
  * - Text selected in the main transcript is captured when the panel opens and is
  *   sent as a quoted excerpt with the first question in its tab, then dropped. The
  *   quote gets a tab of its own (a pristine tab is reused) and is never inherited
@@ -37,10 +37,10 @@
  * - /aside [question]              open the panel, optionally with a question
  * - /aside-model [provider/model]  choose the side model
  * - Ctrl+Shift+S                   shortcut to open the panel
- * - Ctrl+L                         cycle Auto/English/Chinese in the panel
- * - Ctrl+G                         toggle read-only tools for the active tab
  * - Ctrl+\                         command mode: q quote, t snapshot, r refresh snapshot,
  *                                  g tools, y write back, l language; esc cancels
+ * - mouse                          click tabs, status chips (shift+click snapshot to
+ *                                  refresh), and the write-back chip under the last reply
  */
 
 import { execFile, execFileSync } from "node:child_process";
@@ -193,6 +193,7 @@ interface UiMessages {
 	noteToolsEnabled: string;
 	noteToolsDisabled: string;
 	noteNothingToPromote: string;
+	noteAnswerInProgress: string;
 	notePromoted: string;
 	noteUnknownCommand: string;
 
@@ -238,6 +239,8 @@ interface UiMessages {
 
 	promoteHeading: string;
 	promoteQuestionLabel: string;
+	promoteAction: string;
+	promoteHint: string;
 
 	cmdAside: string;
 	cmdAsideModel: string;
@@ -292,6 +295,7 @@ const EN_MESSAGES: UiMessages = {
 	noteToolsEnabled: "Read-only tools enabled",
 	noteToolsDisabled: "Read-only tools disabled; answering from the snapshot only",
 	noteNothingToPromote: "This tab has no answer to write back",
+	noteAnswerInProgress: "Wait for the answer to finish before writing it back",
 	notePromoted: "Written to the main chat (now part of the main context)",
 	noteUnknownCommand: "Unknown command; press ctrl+\\ again for the list",
 
@@ -319,15 +323,15 @@ const EN_MESSAGES: UiMessages = {
 
 	hints: [
 		"enter send · shift+enter newline · esc close (keeps running) · ctrl+c cancel",
-		"ctrl+y write back · ctrl+r refresh snapshot · ctrl+t snapshot · ctrl+g tools",
 		"shift+←/→ tabs · ctrl+n new · ctrl+x close · pgup/pgdn scroll",
-		"select text in the main chat before opening aside · ctrl+\\ for command mode",
+		"ctrl+\\ commands: q quote · t snapshot · r refresh · g tools · y write back · l language",
+		"mouse: click a tab · chips toggle · shift+click snapshot refreshes · click write back under a reply",
 	],
 
 	commandHints: [
 		"command mode · q quote · t snapshot · r refresh snapshot · g tools · y write back · l language",
-		"esc cancels · the direct shortcuts still work when this mode is closed",
-		"mouse: click a tab to switch · click snapshot / quote / tools in the status line",
+		"esc cancels · frequent keys (send, tabs, scroll, cancel) stay direct",
+		"mouse: click a tab · chips toggle · shift+click snapshot refreshes · click write back under a reply",
 	],
 
 	emptyAsk: " Ask about the output in the main conversation.",
@@ -347,6 +351,8 @@ const EN_MESSAGES: UiMessages = {
 
 	promoteHeading: "## Aside (not part of the main conversation)",
 	promoteQuestionLabel: "**Q:**",
+	promoteAction: "write back",
+	promoteHint: "click · ctrl+\\ then y",
 
 	cmdAside: "Ask about the main conversation in a read-only overlay (multi-tab, background streaming)",
 	cmdAsideModel: "Choose the model used by Aside",
@@ -357,8 +363,7 @@ const EN_MESSAGES: UiMessages = {
 	modelSelectTitle: (current) => `Aside model (current: ${current})`,
 	followMainModel: "follow main model",
 
-	languageBadge: (option) =>
-		option === "auto" ? "Language: Auto (EN) · Ctrl+L" : "Language: EN · Ctrl+L",
+	languageBadge: (option) => (option === "auto" ? "Language: Auto (EN)" : "Language: EN"),
 };
 
 const ZH_MESSAGES: UiMessages = {
@@ -398,6 +403,7 @@ const ZH_MESSAGES: UiMessages = {
 	noteToolsEnabled: "已启用只读工具",
 	noteToolsDisabled: "已关闭只读工具，只用快照回答",
 	noteNothingToPromote: "这个 tab 还没有可写入的回答",
+	noteAnswerInProgress: "等这一轮回答结束后再写回",
 	notePromoted: "已写入主对话（会进入主上下文）",
 	noteUnknownCommand: "未知指令，再按一次 ctrl+\\ 查看列表",
 
@@ -425,15 +431,15 @@ const ZH_MESSAGES: UiMessages = {
 
 	hints: [
 		"enter 发送 · shift+enter 换行 · esc 关闭（后台继续）· ctrl+c 取消生成",
-		"ctrl+y 写回主对话 · ctrl+r 刷新快照 · ctrl+t 快照 · ctrl+g 工具开关",
 		"shift+←/→ 切换 tab · ctrl+n 新建 · ctrl+x 关闭 · pgup/pgdn 滚动",
-		"先在主对话里选中文字再打开 aside · ctrl+\\ 进入指令模式",
+		"ctrl+\\ 指令：q 引用 · t 快照 · r 刷新 · g 工具 · y 写回 · l 语言",
+		"鼠标：点 tab 切换 · 点状态栏开关 · shift+点快照刷新 · 点回答下方的写回",
 	],
 
 	commandHints: [
 		"指令模式 · q 引用 · t 快照 · r 刷新快照 · g 工具 · y 写回主对话 · l 语言",
-		"esc 取消 · 退出后直接快捷键仍然可用",
-		"鼠标：点 tab 切换 · 点状态栏的快照 / 引用 / 工具同样生效",
+		"esc 取消 · 常用键（发送/tab/滚动/取消）仍是直接快捷键",
+		"鼠标：点 tab 切换 · 点状态栏开关 · shift+点快照刷新 · 点回答下方的写回",
 	],
 
 	emptyAsk: " 在这里问关于主对话输出的问题。",
@@ -453,6 +459,8 @@ const ZH_MESSAGES: UiMessages = {
 
 	promoteHeading: "## Aside（未参与主对话）",
 	promoteQuestionLabel: "**问：**",
+	promoteAction: "写回主对话",
+	promoteHint: "点击 · ctrl+\\ 再按 y",
 
 	cmdAside: "在主对话之外提问（只读浮层，支持多 tab 和后台生成）",
 	cmdAsideModel: "选择 Aside 使用的模型",
@@ -463,8 +471,7 @@ const ZH_MESSAGES: UiMessages = {
 	modelSelectTitle: (current) => `Aside 模型（当前：${current}）`,
 	followMainModel: "跟随主模型",
 
-	languageBadge: (option) =>
-		option === "auto" ? "语言：跟随系统（中文）· Ctrl+L" : "语言：中文 · Ctrl+L",
+	languageBadge: (option) => (option === "auto" ? "语言：跟随系统（中文）" : "语言：中文"),
 };
 
 let uiLanguage: Language = "en";
@@ -813,6 +820,8 @@ interface AsideTurn {
 	question: string;
 	answer: string;
 	error?: string;
+	/** Set once the turn has been written back to the main conversation */
+	promoted?: boolean;
 	/** Chronological text/tool trace for display */
 	parts: AsidePart[];
 	thinkingChars?: number;
@@ -896,6 +905,13 @@ function finalAnswerText(turn: AsideTurn): string {
 		if (part?.kind === "text" && part.text.trim()) return part.text;
 	}
 	return turn.answer;
+}
+
+/** The last turn when it has an answer that has not been written back yet. */
+function promotableTurn(tab: AsideTab): AsideTurn | undefined {
+	const turn = tab.turns[tab.turns.length - 1];
+	if (!turn || turn.promoted) return undefined;
+	return finalAnswerText(turn).trim() ? turn : undefined;
 }
 
 function createTab(
@@ -2225,6 +2241,8 @@ interface PanelHit {
 	y: number;
 	width: number;
 	run: () => void;
+	/** Runs instead of `run` while Shift is held. */
+	shiftRun?: () => void;
 }
 
 class AsidePanel implements Component, Focusable {
@@ -2322,26 +2340,6 @@ class AsidePanel implements Component, Focusable {
 			this.switchTab(1);
 			return;
 		}
-		if (matchesKey(data, "ctrl+r")) {
-			this.refreshSnapshot();
-			return;
-		}
-		if (matchesKey(data, "ctrl+t")) {
-			this.toggleContext();
-			return;
-		}
-		if (matchesKey(data, "ctrl+g")) {
-			this.toggleTools();
-			return;
-		}
-		if (matchesKey(data, "ctrl+l")) {
-			this.toggleLanguage();
-			return;
-		}
-		if (matchesKey(data, "ctrl+y")) {
-			this.promote();
-			return;
-		}
 		if (matchesKey(data, "pageUp")) {
 			this.scrollBy(-(Math.max(1, this.viewportHeight) - 2));
 			return;
@@ -2385,7 +2383,7 @@ class AsidePanel implements Component, Focusable {
 				(candidate) => candidate.y === event.y && event.x >= candidate.x && event.x < candidate.x + candidate.width,
 			);
 			if (hit) {
-				hit.run();
+				(event.shift && hit.shiftRun ? hit.shiftRun : hit.run)();
 				return { handled: true };
 			}
 		}
@@ -2571,11 +2569,16 @@ class AsidePanel implements Component, Focusable {
 
 	private promote(): void {
 		const tab = activeTab(this.runtime);
-		const turn = [...tab.turns].reverse().find((item) => finalAnswerText(item).trim().length > 0);
+		if (tab.status !== "idle") {
+			this.setStatusNote(t().noteAnswerInProgress);
+			return;
+		}
+		const turn = promotableTurn(tab);
 		if (!turn) {
 			this.setStatusNote(t().noteNothingToPromote);
 			return;
 		}
+		turn.promoted = true;
 		this.runtime.onPromote?.(turn);
 		this.setStatusNote(t().notePromoted);
 	}
@@ -2620,8 +2623,15 @@ class AsidePanel implements Component, Focusable {
 		const viewport = Math.max(3, panelRows - chrome);
 
 		const conversation = this.renderConversation(innerWidth);
-		const windowLines = this.sliceWindow(conversation, viewport);
+		const windowLines = this.sliceWindow(conversation.lines, viewport);
 		this.viewportHeight = viewport;
+		const promote = conversation.promote;
+		if (promote) {
+			const row = promote.line - activeTab(runtime).scrollTop;
+			if (row >= 0 && row < viewport) {
+				this.hits.push({ x: promote.x, y: 4 + row, width: promote.width, run: () => this.promote() });
+			}
+		}
 
 		const titleLine = this.renderTitle(innerWidth);
 		const tabLine = this.renderTabs(innerWidth);
@@ -2690,7 +2700,7 @@ class AsidePanel implements Component, Focusable {
 		const theme = this.theme;
 		const runtime = this.runtime;
 		const tab = activeTab(runtime);
-		const segments: { text: string; run?: () => void }[] = [];
+		const segments: { text: string; run?: () => void; shiftRun?: () => void }[] = [];
 
 		if (this.commandMode) segments.push({ text: theme.fg("accent", t().statusCommandMode) });
 
@@ -2718,8 +2728,13 @@ class AsidePanel implements Component, Focusable {
 				? {
 						text: theme.fg("dim", t().statusSnapshot(formatTokens(tab.snapshot.chars), tab.snapshot.truncated)),
 						run: () => this.toggleContext(),
+						shiftRun: () => this.refreshSnapshot(),
 					}
-				: { text: theme.fg("warning", t().statusSnapshotOff), run: () => this.toggleContext() },
+				: {
+						text: theme.fg("warning", t().statusSnapshotOff),
+						run: () => this.toggleContext(),
+						shiftRun: () => this.refreshSnapshot(),
+					},
 		);
 		if (tab.selection) {
 			segments.push({
@@ -2759,7 +2774,7 @@ class AsidePanel implements Component, Focusable {
 			}
 			const segmentWidth = visibleWidth(segment.text);
 			if (segment.run && x + segmentWidth <= width) {
-				this.hits.push({ x, y, width: segmentWidth, run: segment.run });
+				this.hits.push({ x, y, width: segmentWidth, run: segment.run, shiftRun: segment.shiftRun });
 			}
 			rendered.push(segment.text);
 			x += segmentWidth;
@@ -2767,10 +2782,15 @@ class AsidePanel implements Component, Focusable {
 		return truncateToWidth(` ${rendered.join("")}`, width, "");
 	}
 
-	private renderConversation(width: number): string[] {
+	private renderConversation(width: number): {
+		lines: string[];
+		promote?: { line: number; x: number; width: number };
+	} {
 		const theme = this.theme;
 		const tab = activeTab(this.runtime);
 		const lines: string[] = [];
+		const promotable = tab.status === "idle" ? promotableTurn(tab) : undefined;
+		let promote: { line: number; x: number; width: number } | undefined;
 
 		if (tab.turns.length === 0) {
 			const emptyWidth = Math.max(10, width - 1);
@@ -2799,7 +2819,7 @@ class AsidePanel implements Component, Focusable {
 				);
 				pushEmpty(`❝ ${firstLine(tab.selection.text, 96)}`, "dim");
 			}
-			return lines;
+			return { lines };
 		}
 
 		const contentWidth = Math.max(10, width - 2);
@@ -2838,9 +2858,18 @@ class AsidePanel implements Component, Focusable {
 			}
 
 			if (turn.error) lines.push(theme.fg("error", `  ⚠ ${turn.error}`));
+
+			if (turn === promotable) {
+				const label = ` ${t().promoteAction} `;
+				lines.push("");
+				promote = { line: lines.length, x: 3, width: visibleWidth(label) };
+				lines.push(
+					`  ${theme.bg("selectedBg", theme.fg("text", label))}${theme.fg("dim", `  ${t().promoteHint}`)}`,
+				);
+			}
 		}
 
-		return lines;
+		return { lines, promote };
 	}
 
 	private sliceWindow(lines: string[], height: number): string[] {

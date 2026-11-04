@@ -18,9 +18,9 @@ A good fit: the AI is writing a long document or running a task, and you want to
 - **Automatic read-only snapshot**: opening a tab captures the last assistant reply and the user request before it as reference material for the side model.
 - **Selection quote**: select text in the main transcript, then open Aside; the excerpt gets a tab of its own (an untouched tab is reused) and is sent with exactly one question, then dropped. The selection is consumed on open too, so reopening without selecting again does not repeat it; `Ctrl+\` then `q` (or a click on the `selection` chip) can exclude the quote from the next question.
 - **Read-only tools**: when the snapshot is not enough, the side model can inspect the repo or system files with `read` / `grep` / `find` / `ls`, read git history and commit data with `git`, and fetch a URL with `web_fetch`. There is no `bash`, `edit`, or `write` tool, so it cannot modify files.
-- **Optional write-back**: only `Ctrl+Y` writes a Q&A turn into the main conversation. That is the only step that enters the main context.
+- **Optional write-back**: only the write-back action (command mode `y`, or the chip under the last answer) writes a Q&A turn into the main conversation. That is the only step that enters the main context.
 - **Independent model**: use a cheap/fast model for explanations without spending the main model's budget.
-- **Bilingual UI**: follows the system language by default — Chinese only when the system locale is Chinese, English otherwise. The panel title shows the current mode and shortcut (`Language: Auto (EN) · Ctrl+L` / `语言：跟随系统（中文）· Ctrl+L`); press `Ctrl+L` (or click the label in fullscreen mode) to cycle through Auto / English / Chinese. The choice is saved to `aside.json`.
+- **Bilingual UI**: follows the system language by default — Chinese only when the system locale is Chinese, English otherwise. The panel title shows the current language; click the label (or use command mode `l`) to cycle through Auto / English / Chinese. The choice is saved to `aside.json`.
 
 ## Install
 
@@ -57,7 +57,7 @@ rm ~/.pi/agent/extensions/aside.ts
 
 - `Ctrl+Shift+S` opens the panel
 - `/aside what does this command do?` in the main editor opens it with a first question
-- Inside the panel, the title shows the current mode and shortcut (`Language: Auto (EN) · Ctrl+L` / `Language: EN · Ctrl+L` / `语言：跟随系统（中文）· Ctrl+L` / `语言：中文 · Ctrl+L`); press `Ctrl+L` to cycle Auto / English / Chinese, or click the label in fullscreen mode
+- Inside the panel, the title shows the current language; click the label (or press `Ctrl+\` then `l`) to cycle Auto / English / Chinese
 - `/aside-model [provider/model]` picks the side model
 
 You can use it while the main agent is streaming.
@@ -76,14 +76,9 @@ To quote the conversation: select text in the main transcript (fullscreen mode, 
 | `PageUp` / `PageDown` | Scroll the side answer |
 | `Alt+↑` / `Alt+↓` | Scroll one line |
 | `Ctrl+End` | Jump to the latest output |
-| `Ctrl+R` | Re-capture the main-conversation snapshot |
-| `Ctrl+T` | Toggle the snapshot (when off, the side model only sees your question and any selected quote) |
 | `Ctrl+\` | Command mode, then: `q` quote · `t` snapshot · `r` refresh snapshot · `g` tools · `y` write back · `l` language (`Esc` cancels; frequent keys stay direct) |
-| `Ctrl+G` | Toggle read-only tools for the current tab |
-| `Ctrl+L` | Cycle interface language: Auto / English / Chinese (saved to `aside.json`) |
-| `Ctrl+Y` | Write the latest Q&A turn into the main conversation (**only this enters the main context**) |
 
-The mouse wheel also scrolls. Left-click a tab title to switch tabs, and click `snapshot` / `selection` / `tools` in the status line or the language badge in the title to run the same toggles.
+The mouse wheel also scrolls. Left-click a tab title to switch tabs; click `snapshot` / `selection` / `tools` in the status line to toggle them; **Shift+click** `snapshot` to re-capture it; click the `write back` chip under the last answer to write it into the main conversation (**only this enters the main context**); click the language label in the title to cycle the language.
 
 ## Configuration
 
@@ -105,7 +100,7 @@ Optional file: `~/.pi/agent/aside.json`
 
 - `language`: interface and system-prompt language — `"auto"` (default) follows the
   system locale: Chinese only when the system language is Chinese, English otherwise.
-  `"en"` / `"zh"` force a language. Press `Ctrl+L` inside the panel to cycle
+  `"en"` / `"zh"` force a language. Use command mode `l` (or click the label in the title) to cycle
   Auto / English / Chinese; the choice is written back to this file.
 - `model`: model used only for Aside Q&A; when omitted, the main conversation's
   current model is used. You can also pick one with `/aside-model`; the choice is
@@ -119,7 +114,7 @@ Optional file: `~/.pi/agent/aside.json`
 - `notifyOnComplete`: whether to show a notification when an answer completes while
   the panel is closed.
 - `tools`: enable the read-only tools (`read`, `grep`, `find`, `ls`, `git`). Default `true`.
-  Press `Ctrl+G` inside the panel to toggle them per tab.
+  Toggle them per tab with command mode `g` or a click on the `tools` chip.
 - `git`: enable the read-only git tool. Default `true`; it is only registered when
   `tools` is on. It exposes `show`, `log`, `diff`, `blame`, `file`, `status`,
   `branches`, `tags`, and `ls`; there is no arbitrary git command execution.
@@ -161,12 +156,13 @@ only the message array sent to the model is compacted.
 3. Opening the panel captures a **read-only snapshot**: the last assistant reply on
    the current branch plus the user request before it, and any text currently selected in
    the transcript. Both are sent as part of the system prompt and are copies; later
-   changes in the main conversation are not synced automatically (use `Ctrl+R` for the
-   snapshot; reselect and reopen for the quote).
+   changes in the main conversation are not synced automatically (use command mode `r`
+   or Shift+click the snapshot chip; reselect and reopen for the quote).
 4. The panel is an overlay: the main transcript does not scroll or re-layout, so your
    reading position stays where it was.
 
-The only action that writes back to the main conversation is `Ctrl+Y`. It adds an
+The only action that writes back to the main conversation is write-back (`Ctrl+\`
+then `y`, or the chip under the last answer). It adds an
 `aside` custom message via `pi.sendMessage()`, which becomes part of the main context
 for subsequent model calls.
 
@@ -188,7 +184,7 @@ for subsequent model calls.
   sent with one question; select again to quote again.
 - A quoted selection is sent to the model provider, like the snapshot. Do not select
   secrets you would not send to your provider.
-- Tool calls add tokens and latency. Toggle tools off with `Ctrl+G` when the snapshot is
+- Tool calls add tokens and latency. Toggle tools off (command mode `g`) when the snapshot is
   enough.
 - Token usage for side requests appears in the panel status line but is not counted
   in the main session's usage statistics.
